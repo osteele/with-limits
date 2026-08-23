@@ -255,6 +255,7 @@ fn memory_limit_stops_a_resident_workload() {
         .arg(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "memory_hog_helper"])
         .env("WITH_LIMITS_TEST_MEMORY_HOG", "1")
+        .env("WITH_LIMITS_NICE", "off")
         .output()
         .unwrap();
 
