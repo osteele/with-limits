@@ -11,7 +11,7 @@ impl MemorySpec {
         match self {
             Self::Bytes(bytes) => Ok(bytes),
             Self::AvailableFraction(fraction) => {
-                let bytes = (available as f64 * fraction) as u64;
+                let bytes = (available as f64 * fraction).round() as u64;
                 if bytes == 0 {
                     Err("memory limit resolves to less than one byte".into())
                 } else {
@@ -165,9 +165,98 @@ mod tests {
     fn rejects_non_positive_values() {
         assert!("0".parse::<CpuLimit>().is_err());
         assert!("1e-300".parse::<CpuLimit>().is_err());
+        assert_eq!("0.01".parse(), Ok(CpuLimit(0.01)));
         assert!("0.1B".parse::<MemorySpec>().is_err());
         assert!("101%".parse::<MemorySpec>().is_err());
+        assert!("18446744073709551616B".parse::<MemorySpec>().is_err());
         assert!("-1s".parse::<HumanDuration>().is_err());
         assert!("18446744073709551615s".parse::<HumanDuration>().is_err());
+    }
+
+    #[test]
+    fn parses_generated_integer_memory_sizes_across_every_suffix() {
+        let suffixes = [
+            ("", 1_u64),
+            ("B", 1),
+            ("kB", 1_000),
+            ("MB", 1_000_000),
+            ("GB", 1_000_000_000),
+            ("TB", 1_000_000_000_000),
+            ("KiB", 1 << 10),
+            ("MiB", 1 << 20),
+            ("GiB", 1 << 30),
+            ("TiB", 1 << 40),
+        ];
+
+        for value in 1..=128_u64 {
+            for (suffix, multiplier) in suffixes {
+                assert_eq!(
+                    format!("{value}{suffix}").parse(),
+                    Ok(MemorySpec::Bytes(value * multiplier))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resolves_generated_percentages_against_the_same_snapshot() {
+        let available = 10_000_u64;
+        for percent in 1..=100_u64 {
+            let spec: MemorySpec = format!("{percent}%").parse().unwrap();
+            assert_eq!(spec.resolve(available), Ok(percent * 100));
+        }
+    }
+
+    #[test]
+    fn parses_generated_integer_durations_across_every_suffix() {
+        let suffixes = [
+            ("ms", Duration::from_millis(1)),
+            ("", Duration::from_secs(1)),
+            ("s", Duration::from_secs(1)),
+            ("m", Duration::from_secs(60)),
+            ("h", Duration::from_secs(3_600)),
+            ("d", Duration::from_secs(86_400)),
+        ];
+
+        for value in 1..=128_u32 {
+            for (suffix, unit) in suffixes {
+                assert_eq!(
+                    format!("{value}{suffix}").parse(),
+                    Ok(HumanDuration(unit * value))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_and_non_finite_inputs() {
+        for value in ["", " ", "NaN", "inf", "-inf", ".", "1XB", "1e3"] {
+            assert!(
+                value.parse::<MemorySpec>().is_err(),
+                "unexpected memory value {value:?}"
+            );
+        }
+        for value in ["", " ", "NaN", "inf", "-inf", ".", "1fortnight"] {
+            assert!(
+                value.parse::<HumanDuration>().is_err(),
+                "unexpected duration {value:?}"
+            );
+        }
+        for value in ["", " ", "NaN", "inf", "-inf", ".", "one"] {
+            assert!(
+                value.parse::<CpuLimit>().is_err(),
+                "unexpected CPU value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn formats_byte_boundaries() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0 GiB");
+        assert_eq!(format_bytes(1_u64 << 40), "1.0 TiB");
     }
 }

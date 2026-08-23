@@ -83,6 +83,12 @@ enum CommandResult {
     Code(u8),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MemoryBudget {
+    process_limit: Option<u64>,
+    host_reserve: Option<u64>,
+}
+
 fn main() {
     #[cfg(windows)]
     if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WINDOWS_HELPER_ARG)) {
@@ -118,16 +124,9 @@ fn run() -> Result<CommandResult> {
     } else {
         system.available_memory()
     };
-    let memory = memory_spec
-        .map(|limit| limit.resolve(available))
-        .transpose()
-        .map_err(anyhow::Error::msg)?;
-    let host_memory_reserve = match (memory_spec, memory) {
-        (Some(MemorySpec::AvailableFraction(_)), Some(limit)) => {
-            Some(available.saturating_sub(limit))
-        }
-        _ => None,
-    };
+    let memory_budget = resolve_memory_budget(memory_spec, available)?;
+    let memory = memory_budget.process_limit;
+    let host_memory_reserve = memory_budget.host_reserve;
     let cpu = cli.cpu.map(|limit| limit.0);
     let mut command = build_command(&cli)?;
     command.env("WITH_LIMITS_ACTIVE", "1");
@@ -180,6 +179,27 @@ fn run() -> Result<CommandResult> {
     )
 }
 
+fn resolve_memory_budget(spec: Option<MemorySpec>, available: u64) -> Result<MemoryBudget> {
+    let process_limit = spec
+        .map(|limit| limit.resolve(available))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let host_reserve = match (spec, process_limit) {
+        (Some(MemorySpec::AvailableFraction(_)), Some(limit)) => {
+            Some(available.saturating_sub(limit))
+        }
+        _ => None,
+    };
+    Ok(MemoryBudget {
+        process_limit,
+        host_reserve,
+    })
+}
+
+fn host_reserve_crossed(reserve: u64, available: u64) -> bool {
+    reserve > 0 && available < reserve
+}
+
 fn available_memory(system: &mut System) -> Result<u64> {
     system.refresh_memory();
     let available = system.available_memory();
@@ -201,53 +221,70 @@ fn available_memory(system: &mut System) -> Result<u64> {
         }
         let output = String::from_utf8(output.stdout)
             .context("memory_pressure returned non-UTF-8 output")?;
-        let total = output
-            .lines()
-            .find_map(|line| line.split_once("system has ").map(|(_, rest)| rest))
-            .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok());
-        let percent = output
-            .lines()
-            .find_map(|line| {
-                line.split_once("memory free percentage:")
-                    .map(|(_, rest)| rest.trim())
-            })
-            .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok());
-        if let (Some(total), Some(percent)) = (total, percent) {
-            if !(0.0..=100.0).contains(&percent) {
-                bail!("memory_pressure returned an invalid free-memory percentage");
-            }
-            let available = (total as f64 * percent / 100.0) as u64;
-            if available > 0 {
-                return Ok(available);
-            }
-        }
-        bail!("could not parse available memory from memory_pressure output");
+        parse_memory_pressure_available(&output)
     }
 
     #[cfg(target_os = "linux")]
     {
         let meminfo = std::fs::read_to_string("/proc/meminfo")
             .context("could not read /proc/meminfo to determine available memory")?;
-        if let Some(kibibytes) = meminfo.lines().find_map(|line| {
-            let fields: Vec<_> = line
-                .strip_prefix("MemAvailable:")?
-                .split_whitespace()
-                .collect();
-            match fields.as_slice() {
-                [value, "kB"] => value.parse::<u64>().ok(),
-                _ => None,
-            }
-        }) {
-            if kibibytes > 0 {
-                return Ok(kibibytes.saturating_mul(1024));
-            }
-        }
-        bail!("could not parse MemAvailable from /proc/meminfo");
+        parse_linux_mem_available(&meminfo)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bail!("the platform reported no available memory");
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_mem_available(meminfo: &str) -> Result<u64> {
+    let fields: Vec<_> = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .context("/proc/meminfo does not contain MemAvailable")?
+        .split_whitespace()
+        .collect();
+    let [value, unit] = fields.as_slice() else {
+        bail!("MemAvailable has an unexpected field layout");
+    };
+    if *unit != "kB" {
+        bail!("MemAvailable uses unexpected unit {unit:?}");
+    }
+    let kibibytes = value
+        .parse::<u64>()
+        .context("MemAvailable is not an unsigned integer")?;
+    if kibibytes == 0 {
+        bail!("MemAvailable reports zero available memory");
+    }
+    kibibytes
+        .checked_mul(1024)
+        .context("MemAvailable overflows a byte count")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn parse_memory_pressure_available(output: &str) -> Result<u64> {
+    let total = output
+        .lines()
+        .find_map(|line| line.strip_prefix("The system has "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .context("memory_pressure output does not report total memory")?
+        .parse::<u64>()
+        .context("memory_pressure total memory is not an unsigned integer")?;
+    let percent = output
+        .lines()
+        .find_map(|line| line.strip_prefix("System-wide memory free percentage:"))
+        .map(str::trim)
+        .and_then(|value| value.strip_suffix('%'))
+        .context("memory_pressure output does not report a percentage")?
+        .parse::<f64>()
+        .context("memory_pressure percentage is not numeric")?;
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        bail!("memory_pressure returned an invalid free-memory percentage");
+    }
+    let available = (total as f64 * percent / 100.0) as u64;
+    if available == 0 {
+        bail!("memory_pressure reports zero available memory");
+    }
+    Ok(available)
 }
 
 fn build_command(cli: &Cli) -> Result<Command> {
@@ -464,7 +501,7 @@ fn supervise(
                 next_host_memory_check = Instant::now()
                     .checked_add(Duration::from_secs(1))
                     .context("platform clock cannot schedule memory sampling")?;
-                if available < reserve {
+                if host_reserve_crossed(reserve, available) {
                     eprintln!(
                         "with-limits: host memory reserve crossed ({} available < {} reserved)",
                         format_bytes(available),
@@ -549,7 +586,7 @@ impl CpuThrottle {
         targets: &[process_tree::ProcessIdentity],
         deadline: Option<Instant>,
     ) -> Result<()> {
-        let pause = self.pause_debt.min(Duration::from_secs(1));
+        let pause = self.pending_pause(Duration::from_secs(1));
         if pause.is_zero() {
             return Ok(());
         }
@@ -560,8 +597,16 @@ impl CpuThrottle {
         }
         let result = sleep_until_or_deadline(pause, deadline);
         let resume_result = controller.resume(targets);
-        self.pause_debt -= result;
+        self.consume_pause(result);
         resume_result
+    }
+
+    fn pending_pause(&self, maximum: Duration) -> Duration {
+        self.pause_debt.min(maximum)
+    }
+
+    fn consume_pause(&mut self, duration: Duration) {
+        self.pause_debt = self.pause_debt.saturating_sub(duration);
     }
 }
 
@@ -644,4 +689,137 @@ fn status_exit_code(status: ExitStatus) -> i32 {
 #[allow(dead_code)]
 fn display_program(program: &OsStr) -> String {
     program.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MACOS_MEMORY_PRESSURE: &str = "The system has 17179869184 (1048576 pages with a page size of 16384).\nSystem-wide memory free percentage: 34%\n";
+
+    #[test]
+    fn parses_linux_mem_available_fixture() {
+        let fixture = "MemTotal:       16384000 kB\nMemFree:         1024000 kB\nMemAvailable:    8388608 kB\nBuffers:          128000 kB\n";
+        assert_eq!(
+            parse_linux_mem_available(fixture).unwrap(),
+            8 * 1024 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn rejects_linux_meminfo_schema_drift_and_invalid_values() {
+        for fixture in [
+            "MemTotal: 1000 kB\n",
+            "MemAvailable: 12 MB\n",
+            "MemAvailable: many kB\n",
+            "MemAvailable: 12 kB extra\n",
+            "MemAvailable: 0 kB\n",
+            "MemAvailable: 18446744073709551615 kB\n",
+        ] {
+            assert!(
+                parse_linux_mem_available(fixture).is_err(),
+                "unexpectedly accepted {fixture:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_macos_memory_pressure_fixture() {
+        assert_eq!(
+            parse_memory_pressure_available(MACOS_MEMORY_PRESSURE).unwrap(),
+            5_841_155_522
+        );
+    }
+
+    #[test]
+    fn rejects_macos_memory_pressure_schema_drift_and_invalid_values() {
+        for fixture in [
+            "System-wide memory free percentage: 34%\n",
+            "The system has 17179869184 bytes.\n",
+            "The system has many bytes.\nSystem-wide memory free percentage: 34%\n",
+            "The system has 17179869184 bytes.\nSystem-wide memory free percentage: many%\n",
+            "The system has 17179869184 bytes.\nSystem-wide memory free percentage: 101%\n",
+            "The system has 17179869184 bytes.\nSystem-wide memory free percentage: 0%\n",
+        ] {
+            assert!(
+                parse_memory_pressure_available(fixture).is_err(),
+                "unexpectedly accepted {fixture:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_throttle_accumulates_and_consumes_multi_interval_debt() {
+        let mut throttle = CpuThrottle::new();
+        throttle.record(400.0, 1.0, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            throttle.pending_pause(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        throttle.consume_pause(Duration::from_secs(1));
+        assert_eq!(
+            throttle.pending_pause(Duration::from_secs(1)),
+            Duration::from_secs(1)
+        );
+        throttle.consume_pause(Duration::from_secs(1));
+        throttle.consume_pause(Duration::from_secs(1));
+        assert_eq!(throttle.pause_debt, Duration::ZERO);
+    }
+
+    #[test]
+    fn cpu_throttle_ignores_samples_within_the_allowance() {
+        let mut throttle = CpuThrottle::new();
+        throttle.record(49.9, 0.5, Duration::from_secs(10)).unwrap();
+        assert_eq!(throttle.pause_debt, Duration::ZERO);
+    }
+
+    #[test]
+    fn cpu_throttle_rejects_non_finite_samples() {
+        let mut throttle = CpuThrottle::new();
+        assert!(throttle
+            .record(f64::NAN, 1.0, Duration::from_secs(1))
+            .is_err());
+        assert!(throttle
+            .record(f64::INFINITY, 1.0, Duration::from_secs(1))
+            .is_err());
+    }
+
+    #[test]
+    fn percentage_memory_budget_preserves_a_shared_host_reserve() {
+        let budget =
+            resolve_memory_budget(Some(MemorySpec::AvailableFraction(0.7)), 10_000).unwrap();
+        assert_eq!(
+            budget,
+            MemoryBudget {
+                process_limit: Some(7_000),
+                host_reserve: Some(3_000),
+            }
+        );
+
+        assert!(!host_reserve_crossed(3_000, 3_000));
+        assert!(host_reserve_crossed(3_000, 2_999));
+        assert!(
+            host_reserve_crossed(budget.host_reserve.unwrap(), 2_999),
+            "every agent launched from the same snapshot observes the same crossed reserve"
+        );
+    }
+
+    #[test]
+    fn absolute_memory_budget_does_not_claim_a_host_reserve() {
+        assert_eq!(
+            resolve_memory_budget(Some(MemorySpec::Bytes(4_096)), 10_000).unwrap(),
+            MemoryBudget {
+                process_limit: Some(4_096),
+                host_reserve: None,
+            }
+        );
+        assert_eq!(
+            resolve_memory_budget(None, 10_000).unwrap(),
+            MemoryBudget {
+                process_limit: None,
+                host_reserve: None,
+            }
+        );
+    }
 }
