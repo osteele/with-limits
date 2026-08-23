@@ -18,6 +18,7 @@ mod imp {
     pub struct Controller {
         pgid: i32,
         targets: Arc<RwLock<Vec<ProcessIdentity>>>,
+        signals: Option<Signals>,
         armed: bool,
     }
 
@@ -35,9 +36,11 @@ mod imp {
                     command.pre_exec(move || lower_priority(adjustment));
                 }
             }
+            let signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
             Ok(Self {
                 pgid: 0,
                 targets: Arc::new(RwLock::new(Vec::new())),
+                signals: Some(signals),
                 armed: true,
             })
         }
@@ -49,7 +52,10 @@ mod imp {
             }
             let pgid = self.pgid;
             let targets = Arc::clone(&self.targets);
-            let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+            let mut signals = self
+                .signals
+                .take()
+                .context("signal forwarding is already attached")?;
             thread::spawn(move || {
                 for signal in signals.forever() {
                     let current = targets
