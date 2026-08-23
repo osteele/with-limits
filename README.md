@@ -1,13 +1,19 @@
 # with-limits
 
-`with-limits` runs a command with limits on its memory, sustained CPU use, and
-wall-clock runtime. It supervises the command's process tree on macOS, Windows,
-and Linux.
+`with-limits` keeps a development machine responsive while background commands
+run. It gives foreground applications scheduling priority, limits the child
+process tree's memory, sustained CPU use, and wall-clock runtime, and works on
+macOS, Windows, and Linux.
 
 The motivating case is concurrent agents doing machine-learning or research
 work. Several agents can each start a RAM-intensive job that looks reasonable
 in isolation, while their combined memory use exhausts and crashes the host.
 Putting a process-tree limit around each job contains that failure.
+
+The entire child tree also runs at a fixed lower scheduling priority: niceness
+`+10` on Unix and Below Normal priority on Windows. This still lets a job use
+otherwise-idle CPU capacity while allowing interactive applications to win
+when they need it.
 
 For a time limit alone, GNU `timeout` (installed as `gtimeout` by Homebrew) is
 the established choice. `with-limits` is useful when one portable command
@@ -15,15 +21,20 @@ should also constrain memory or sustained CPU consumption.
 
 ## Installation
 
-Install the current release from GitHub:
+Installation requires Rust 1.85 or newer and Cargo. The
+[Rust toolchain installer](https://rustup.rs/) provides both.
+
+Install the current `main` branch from GitHub:
 
 ```sh
 cargo install --git https://github.com/osteele/with-limits
 ```
 
-Or build the current checkout:
+Or clone and install a local checkout:
 
 ```sh
+git clone https://github.com/osteele/with-limits.git
+cd with-limits
 cargo install --path .
 ```
 
@@ -32,6 +43,16 @@ guard, not a security sandbox for hostile code.
 
 ## Usage
 
+Verify the installation with a command available alongside Cargo:
+
+```sh
+with-limits --time 5s -- cargo --version
+```
+
+A successful run prints the Cargo version and exits with status zero. In an
+interactive terminal, the startup summary also reports the time limit and
+lower scheduling priority.
+
 Place the command after `--`:
 
 ```sh
@@ -39,7 +60,8 @@ with-limits --memory 8GiB --cpu 2 --time 30m -- python train.py
 ```
 
 Use `-c` to run a shell command. On macOS this uses `/bin/zsh`; on other Unix
-systems it uses `/bin/sh`; and on Windows it uses `cmd.exe`.
+systems it uses `/bin/sh`; and on Windows it uses `%COMSPEC%`, falling back to
+`cmd.exe` when that variable is unset.
 
 ```sh
 with-limits --memory 4GiB -c 'just format && just check'
@@ -53,6 +75,9 @@ concurrent guarded agents react to their combined memory use:
 ```sh
 with-limits -c 'just format && just check'
 ```
+
+Lower scheduling priority is independent of the resource-limit options and is
+enabled for every command by default.
 
 Options:
 
@@ -74,6 +99,19 @@ Options:
 - `--quiet`, `-q` suppresses the interactive startup summary. Limit violations
   are still reported.
 
+## Environment
+
+`WITH_LIMITS_NICE` controls fixed priority lowering. It defaults to `10`. On
+Unix, values from `1` through `19` are added to the child process's inherited
+niceness; descendants inherit the result. On Windows, any enabled value selects
+the Below Normal priority class for the Job Object and therefore its entire
+process tree. Set it to `0`, `off`, `false`, or `no` to disable priority
+lowering.
+
+The priority does not change in response to load or the number of running
+agents. Fixed lower priority lets foreground work preempt background jobs while
+leaving idle CPU capacity available to them.
+
 ## Enforcement
 
 On Windows, a Job Object provides native process-tree containment and CPU
@@ -84,12 +122,17 @@ its descendants. On macOS and Linux it also samples CPU use, briefly suspending
 and resuming the tracked processes to maintain the requested sustained
 allowance. Wall time is supervised by `with-limits` on every platform.
 
-Sampled resident memory is the sum reported for the processes in the tree. It
-can count shared pages more than once, so leave headroom when processes share
-large mappings. Sampling also means a very brief spike can occur between
-observations. Percentage and `auto` memory limits additionally enforce the
-unallocated share as a host-memory reserve, so unrelated or concurrently
-guarded growth can stop the command before its own RSS reaches its ceiling.
+The supervisor itself keeps its original priority so it can continue enforcing
+limits promptly. Only the launched command and its descendants receive the
+lower priority.
+
+Sampled resident memory is the sum of resident set size (RSS) reported for the
+processes in the tree. It can count shared pages more than once, so leave
+headroom when processes share large mappings. Sampling also means a very brief
+spike can occur between observations. Percentage and `auto` memory limits
+additionally enforce the unallocated share as a host-memory reserve, so
+unrelated or concurrently guarded growth can stop the command before its own
+RSS reaches its ceiling.
 
 Signals sent to `with-limits` are forwarded to the Unix process group and to
 tracked descendants that have created another process group or session. On
@@ -124,7 +167,9 @@ These follow GNU `timeout` conventions where they overlap.
   the same as aggregate resident memory and sustained CPU rate for a process
   tree.
 - GNU [`nice`](https://www.gnu.org/software/coreutils/manual/html_node/nice-invocation.html)
-  changes scheduling priority; it does not impose a CPU ceiling.
+  changes scheduling priority on Unix. `with-limits` applies the same basic
+  policy automatically to the whole contained tree, adds a Windows equivalent,
+  and also enforces resource ceilings.
 - Linux `taskset` restricts CPU affinity but permits full use of the selected
   cores. [`cpulimit`](https://github.com/opsengine/cpulimit) uses sampled
   stop/resume control similar to the Unix CPU strategy here, but is not a GNU

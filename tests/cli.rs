@@ -74,6 +74,25 @@ fn graceful_termination_helper() {
 }
 
 #[test]
+#[ignore]
+fn priority_tree_helper() {
+    let Some(expected) = std::env::var_os("WITH_LIMITS_TEST_PRIORITY") else {
+        return;
+    };
+    let expected: i64 = expected.to_string_lossy().parse().unwrap();
+    assert_eq!(current_priority(), expected);
+
+    if std::env::var_os("WITH_LIMITS_TEST_PRIORITY_DESCENDANT").is_none() {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "priority_tree_helper"])
+            .env("WITH_LIMITS_TEST_PRIORITY_DESCENDANT", "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "priority-checking descendant failed");
+    }
+}
+
+#[test]
 fn accepts_combined_resource_limits() {
     let status = binary()
         .args([
@@ -184,6 +203,23 @@ fn rejects_native_memory_enforcement_when_only_sampling_is_available() {
     assert_eq!(output.status.code(), Some(125));
     assert!(String::from_utf8_lossy(&output.stderr)
         .contains("native memory enforcement is unavailable"));
+}
+
+#[test]
+fn lowers_the_entire_process_tree_priority_by_default() {
+    assert_tree_priority(None, default_lower_priority());
+}
+
+#[cfg(unix)]
+#[test]
+fn honors_the_nice_adjustment_override() {
+    let current = current_priority();
+    assert_tree_priority(Some("5"), current.saturating_add(5).min(19));
+}
+
+#[test]
+fn allows_priority_lowering_to_be_disabled() {
+    assert_tree_priority(Some("off"), current_priority());
 }
 
 #[cfg(unix)]
@@ -405,4 +441,49 @@ fn temp_path(label: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
     ))
+}
+
+fn assert_tree_priority(nice: Option<&str>, expected: i64) {
+    let mut command = binary();
+    command
+        .args(["--time", "5s", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "priority_tree_helper"])
+        .env("WITH_LIMITS_TEST_PRIORITY", expected.to_string());
+    match nice {
+        Some(value) => {
+            command.env("WITH_LIMITS_NICE", value);
+        }
+        None => {
+            command.env_remove("WITH_LIMITS_NICE");
+        }
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "priority check failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn current_priority() -> i64 {
+    i64::from(unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) })
+}
+
+#[cfg(unix)]
+fn default_lower_priority() -> i64 {
+    current_priority().saturating_add(10).min(19)
+}
+
+#[cfg(windows)]
+fn current_priority() -> i64 {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetPriorityClass};
+    i64::from(unsafe { GetPriorityClass(GetCurrentProcess()) })
+}
+
+#[cfg(windows)]
+fn default_lower_priority() -> i64 {
+    i64::from(windows_sys::Win32::System::Threading::BELOW_NORMAL_PRIORITY_CLASS)
 }

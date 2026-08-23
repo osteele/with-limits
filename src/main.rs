@@ -19,6 +19,8 @@ const EXIT_WRAPPER_ERROR: u8 = 125;
 const EXIT_CANNOT_INVOKE: u8 = 126;
 const EXIT_NOT_FOUND: u8 = 127;
 const EXIT_MEMORY: u8 = 137;
+const DEFAULT_NICE_ADJUSTMENT: i32 = 10;
+const NICE_ENV: &str = "WITH_LIMITS_NICE";
 
 #[cfg(windows)]
 const WINDOWS_HELPER_ARG: &str = "--internal-windows-launch-helper";
@@ -128,10 +130,11 @@ fn run() -> Result<CommandResult> {
     let memory = memory_budget.process_limit;
     let host_memory_reserve = memory_budget.host_reserve;
     let cpu = cli.cpu.map(|limit| limit.0);
+    let nice_adjustment = configured_nice_adjustment()?;
     let mut command = build_command(&cli)?;
     command.env("WITH_LIMITS_ACTIVE", "1");
 
-    let mut controller = platform::Controller::prepare(&mut command, memory, cpu)?;
+    let mut controller = platform::Controller::prepare(&mut command, memory, cpu, nice_adjustment)?;
     if cli.require_native {
         if memory.is_some() && !controller.memory_is_native() {
             bail!("native memory enforcement is unavailable on this platform");
@@ -141,7 +144,7 @@ fn run() -> Result<CommandResult> {
         }
     }
     if !cli.quiet && io::stderr().is_terminal() {
-        print_summary(&cli, memory, &controller);
+        print_summary(&cli, memory, nice_adjustment, &controller);
     }
 
     let mut child = match command.spawn() {
@@ -198,6 +201,33 @@ fn resolve_memory_budget(spec: Option<MemorySpec>, available: u64) -> Result<Mem
 
 fn host_reserve_crossed(reserve: u64, available: u64) -> bool {
     reserve > 0 && available < reserve
+}
+
+fn configured_nice_adjustment() -> Result<Option<i32>> {
+    parse_nice_adjustment(std::env::var_os(NICE_ENV).as_deref())
+}
+
+fn parse_nice_adjustment(value: Option<&OsStr>) -> Result<Option<i32>> {
+    let Some(value) = value else {
+        return Ok(Some(DEFAULT_NICE_ADJUSTMENT));
+    };
+    let value = value
+        .to_str()
+        .context("WITH_LIMITS_NICE contains non-UTF-8 text")?
+        .trim();
+    if ["0", "off", "false", "no"]
+        .iter()
+        .any(|disabled| value.eq_ignore_ascii_case(disabled))
+    {
+        return Ok(None);
+    }
+    let adjustment = value
+        .parse::<i32>()
+        .context("WITH_LIMITS_NICE must be an integer from 1 through 19, or off")?;
+    if !(1..=19).contains(&adjustment) {
+        bail!("WITH_LIMITS_NICE must be from 1 through 19, or off");
+    }
+    Ok(Some(adjustment))
 }
 
 fn available_memory(system: &mut System) -> Result<u64> {
@@ -400,7 +430,12 @@ fn default_unix_shell() -> OsString {
     }
 }
 
-fn print_summary(cli: &Cli, memory: Option<u64>, controller: &platform::Controller) {
+fn print_summary(
+    cli: &Cli,
+    memory: Option<u64>,
+    nice_adjustment: Option<i32>,
+    controller: &platform::Controller,
+) {
     let mut limits = Vec::new();
     if let Some(bytes) = memory {
         let method = if controller.memory_is_native() {
@@ -420,6 +455,13 @@ fn print_summary(cli: &Cli, memory: Option<u64>, controller: &platform::Controll
     }
     if let Some(limit) = cli.time {
         limits.push(format!("time {limit}"));
+    }
+    if let Some(adjustment) = nice_adjustment {
+        if cfg!(windows) {
+            limits.push("priority below normal".into());
+        } else {
+            limits.push(format!("niceness +{adjustment}"));
+        }
     }
     eprintln!("with-limits: {}", limits.join(", "));
 }
@@ -821,5 +863,30 @@ mod tests {
                 host_reserve: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_nice_adjustment_and_disable_values() {
+        assert_eq!(parse_nice_adjustment(None).unwrap(), Some(10));
+        assert_eq!(
+            parse_nice_adjustment(Some(OsStr::new(" 5 "))).unwrap(),
+            Some(5)
+        );
+        for value in ["0", "off", "OFF", "false", "no"] {
+            assert_eq!(
+                parse_nice_adjustment(Some(OsStr::new(value))).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_nice_adjustments() {
+        for value in ["", "-1", "20", "low", "1.5"] {
+            assert!(
+                parse_nice_adjustment(Some(OsStr::new(value))).is_err(),
+                "unexpectedly accepted {value:?}"
+            );
+        }
     }
 }

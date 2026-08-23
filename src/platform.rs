@@ -26,9 +26,15 @@ mod imp {
             command: &mut Command,
             memory: Option<u64>,
             cpu: Option<f64>,
+            nice_adjustment: Option<i32>,
         ) -> Result<Self> {
             let _ = (memory, cpu);
             command.process_group(0);
+            if let Some(adjustment) = nice_adjustment {
+                unsafe {
+                    command.pre_exec(move || lower_priority(adjustment));
+                }
+            }
             Ok(Self {
                 pgid: 0,
                 targets: Arc::new(RwLock::new(Vec::new())),
@@ -93,6 +99,19 @@ mod imp {
 
         pub fn disarm(&mut self) {
             self.armed = false;
+        }
+    }
+
+    fn lower_priority(adjustment: i32) -> io::Result<()> {
+        let current = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        let target = current.saturating_add(adjustment).min(19);
+        if target <= current {
+            return Ok(());
+        }
+        if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, target) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
     }
 
@@ -195,9 +214,11 @@ mod imp {
                 JobObjectExtendedLimitInformation, SetInformationJobObject, TerminateJobObject,
                 JOBOBJECT_CPU_RATE_CONTROL_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
                 JOB_OBJECT_CPU_RATE_CONTROL_ENABLE, JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
-                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
             },
-            Threading::{CreateEventW, GetActiveProcessorCount, SetEvent},
+            Threading::{
+                CreateEventW, GetActiveProcessorCount, SetEvent, BELOW_NORMAL_PRIORITY_CLASS,
+            },
         },
     };
 
@@ -214,6 +235,7 @@ mod imp {
             command: &mut Command,
             memory: Option<u64>,
             cpu: Option<f64>,
+            nice_adjustment: Option<i32>,
         ) -> Result<Self> {
             let _ = memory;
             let gate_name = format!(
@@ -243,13 +265,17 @@ mod imp {
             command.env(GATE_ENV, gate_name);
 
             let controller = Self { job, gate };
-            controller.configure(cpu)?;
+            controller.configure(cpu, nice_adjustment.is_some())?;
             Ok(controller)
         }
 
-        fn configure(&self, cpu: Option<f64>) -> Result<()> {
+        fn configure(&self, cpu: Option<f64>, lower_priority: bool) -> Result<()> {
             let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if lower_priority {
+                limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PRIORITY_CLASS;
+                limits.BasicLimitInformation.PriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+            }
             set_job_info(
                 self.job,
                 JobObjectExtendedLimitInformation,
