@@ -1,5 +1,10 @@
 # with-limits
 
+[![Crates.io](https://img.shields.io/crates/v/with-limits.svg)](https://crates.io/crates/with-limits)
+[![CI](https://github.com/osteele/with-limits/actions/workflows/ci.yml/badge.svg)](https://github.com/osteele/with-limits/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+
 `with-limits` keeps a development machine responsive while background commands
 run. It gives foreground applications scheduling priority, limits the child
 process tree's memory, sustained CPU use, and wall-clock runtime, and works on
@@ -24,13 +29,16 @@ should also constrain memory or sustained CPU consumption.
 Installation requires Rust 1.85 or newer and Cargo. The
 [Rust toolchain installer](https://rustup.rs/) provides both.
 
-Install the current `main` branch from GitHub:
+Install from [crates.io](https://crates.io/crates/with-limits):
 
 ```sh
-cargo install --git https://github.com/osteele/with-limits
+cargo install with-limits --locked
 ```
 
-Or clone and install a local checkout:
+This installs `with-limits` in Cargo's binary directory, normally
+`~/.cargo/bin`. Ensure that directory is on your `PATH`.
+
+### Build from Source
 
 ```sh
 git clone https://github.com/osteele/with-limits.git
