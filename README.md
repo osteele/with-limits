@@ -99,6 +99,30 @@ Options:
 - `--quiet`, `-q` suppresses the interactive startup summary. Limit violations
   are still reported.
 
+## Agent hooks
+
+Agent lifecycle hooks can place selected shell workloads under `with-limits`
+without changing the command the model generates. The included example wraps
+POSIX `uv run` requests, including the rest of a pipeline or compound command,
+under one default memory budget:
+
+```text
+uv run python experiment.py && just process-results
+→ with-limits -c 'uv run python experiment.py && just process-results'
+```
+
+| Agent | Automatic wrapping path |
+| --- | --- |
+| Claude Code | Native `PreToolUse` command hook |
+| Codex | Native `PreToolUse` command hook |
+| OpenCode | `tool.execute.before` plugin |
+| Kimi Code CLI | Session-wide launcher or command-specific PATH wrapper |
+
+Claude Code and Codex can use the same hook script. OpenCode reaches it through
+a small plugin. Kimi hooks cannot currently replace a tool input, so they cannot
+apply this command-by-command rewrite. See [Agent shell hooks](docs/agent-hooks.md)
+for the example, configuration, security tradeoff, and platform scope.
+
 ## Environment
 
 `WITH_LIMITS_NICE` controls fixed priority lowering. It defaults to `10`. On

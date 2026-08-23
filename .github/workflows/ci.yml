@@ -20,12 +20,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Lint
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --all-targets --locked
+      - name: Test agent hook example
+        run: python -m unittest -v tests/test_hook_example.py
 
   msrv:
     name: Minimum supported Rust
