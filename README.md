@@ -46,7 +46,9 @@ with-limits --memory 4GiB -c 'just format && just check'
 ```
 
 When no limit option is supplied, `with-limits` applies `--memory auto`, which
-is 70% of the memory available when the command starts:
+is 70% of the memory available when the command starts. It also preserves the
+remaining 30% as a continuously checked host reserve. This lets several
+concurrent guarded agents react to their combined memory use:
 
 ```sh
 with-limits -c 'just format && just check'
@@ -58,7 +60,8 @@ Options:
   suffixes such as `GB`, IEC suffixes such as `GiB`, `auto`, or a percentage of
   initially available memory such as `60%`.
 - `--cpu CORES` limits sustained CPU use, where `1` is the capacity of one
-  logical core. Fractional values such as `0.5` are accepted.
+  logical core. Fractional values such as `0.5` are accepted; the minimum is
+  `0.01`.
 - `--time DURATION`, `-t DURATION` limits wall-clock runtime. Durations use the
   GNU `timeout` suffixes `s`, `m`, `h`, and `d`; milliseconds use `ms`.
 - `--kill-after DURATION` (also `--grace`) controls how long graceful
@@ -66,28 +69,34 @@ Options:
   default is two seconds.
 - `--shell PATH` selects the shell used by `-c`.
 - `--require-native` rejects a requested memory or CPU limit if the platform
-  would enforce it by sampling.
+  would enforce it by sampling. Memory limits are currently sampled on every
+  platform; Windows CPU limits are native.
 - `--quiet`, `-q` suppresses the interactive startup summary. Limit violations
   are still reported.
 
 ## Enforcement
 
-On Windows, a Job Object provides native process-tree memory and CPU limits and
-ensures descendants are terminated with the job. On macOS and Linux,
-`with-limits` samples the resident memory and CPU use of the command and its
-descendants. CPU enforcement briefly suspends and resumes the command's process
-group to maintain the requested sustained allowance. Wall time is supervised
-by `with-limits` on every platform.
+On Windows, a Job Object provides native process-tree containment and CPU
+limits. The real command is held behind a launch gate until its helper has been
+assigned to the job, so it and the descendants it creates inherit containment.
+On every platform, `with-limits` samples the resident memory of the command and
+its descendants. On macOS and Linux it also samples CPU use, briefly suspending
+and resuming the tracked processes to maintain the requested sustained
+allowance. Wall time is supervised by `with-limits` on every platform.
 
 Sampled resident memory is the sum reported for the processes in the tree. It
 can count shared pages more than once, so leave headroom when processes share
 large mappings. Sampling also means a very brief spike can occur between
-observations.
+observations. Percentage and `auto` memory limits additionally enforce the
+unallocated share as a host-memory reserve, so unrelated or concurrently
+guarded growth can stop the command before its own RSS reaches its ceiling.
 
-Signals sent to `with-limits` are forwarded to the Unix process group. On Unix,
-a limit first requests graceful termination, waits for `--kill-after`, and then
-forces termination if any tracked descendant remains. A Windows Job Object
-terminates the tree as a unit.
+Signals sent to `with-limits` are forwarded to the Unix process group and to
+tracked descendants that have created another process group or session. On
+Unix, a limit first requests graceful termination, waits for `--kill-after`,
+and then forces termination if any tracked descendant remains. A Windows Job
+Object terminates the tree as a unit. If required monitoring or enforcement
+fails, `with-limits` stops the workload and exits with status 125.
 
 ## Exit status
 

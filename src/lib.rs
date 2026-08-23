@@ -7,10 +7,17 @@ pub enum MemorySpec {
 }
 
 impl MemorySpec {
-    pub fn resolve(self, available: u64) -> u64 {
+    pub fn resolve(self, available: u64) -> Result<u64, String> {
         match self {
-            Self::Bytes(bytes) => bytes,
-            Self::AvailableFraction(fraction) => (available as f64 * fraction) as u64,
+            Self::Bytes(bytes) => Ok(bytes),
+            Self::AvailableFraction(fraction) => {
+                let bytes = (available as f64 * fraction) as u64;
+                if bytes == 0 {
+                    Err("memory limit resolves to less than one byte".into())
+                } else {
+                    Ok(bytes)
+                }
+            }
         }
     }
 }
@@ -48,10 +55,14 @@ impl FromStr for MemorySpec {
             _ => return Err(format!("unknown memory-size suffix {suffix:?}")),
         };
         let bytes = number * multiplier;
-        if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        if !bytes.is_finite() || bytes >= u64::MAX as f64 {
             return Err("memory size is too large".into());
         }
-        Ok(Self::Bytes(bytes as u64))
+        let bytes = bytes as u64;
+        if bytes == 0 {
+            return Err("memory size must be at least one byte".into());
+        }
+        Ok(Self::Bytes(bytes))
     }
 }
 
@@ -61,7 +72,11 @@ pub struct CpuLimit(pub f64);
 impl FromStr for CpuLimit {
     type Err = String;
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Ok(Self(positive_number(value, "CPU limit")?))
+        let cores = positive_number(value, "CPU limit")?;
+        if cores < 0.01 {
+            return Err("CPU limit must be at least 0.01 cores".into());
+        }
+        Ok(Self(cores))
     }
 }
 
@@ -85,10 +100,9 @@ impl FromStr for HumanDuration {
             "d" => number * 86_400.0,
             _ => return Err(format!("unknown duration suffix {suffix:?}")),
         };
-        if !seconds.is_finite() || seconds > Duration::MAX.as_secs_f64() {
-            return Err("duration is too large".into());
-        }
-        Ok(Self(Duration::from_secs_f64(seconds)))
+        Duration::try_from_secs_f64(seconds)
+            .map(Self)
+            .map_err(|_| "duration is too large".into())
     }
 }
 
@@ -150,7 +164,10 @@ mod tests {
     #[test]
     fn rejects_non_positive_values() {
         assert!("0".parse::<CpuLimit>().is_err());
+        assert!("1e-300".parse::<CpuLimit>().is_err());
+        assert!("0.1B".parse::<MemorySpec>().is_err());
         assert!("101%".parse::<MemorySpec>().is_err());
         assert!("-1s".parse::<HumanDuration>().is_err());
+        assert!("18446744073709551615s".parse::<HumanDuration>().is_err());
     }
 }

@@ -7,7 +7,7 @@ use process_tree::ProcessTree;
 use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal},
-    process::{Child, Command, ExitCode, ExitStatus},
+    process::{Child, Command, ExitStatus},
     thread,
     time::{Duration, Instant},
 };
@@ -19,6 +19,11 @@ const EXIT_WRAPPER_ERROR: u8 = 125;
 const EXIT_CANNOT_INVOKE: u8 = 126;
 const EXIT_NOT_FOUND: u8 = 127;
 const EXIT_MEMORY: u8 = 137;
+
+#[cfg(windows)]
+const WINDOWS_HELPER_ARG: &str = "--internal-windows-launch-helper";
+#[cfg(windows)]
+const WINDOWS_GATE_ENV: &str = "WITH_LIMITS_WINDOWS_GATE";
 
 #[derive(Debug, Parser)]
 #[command(version, about, trailing_var_arg = true)]
@@ -78,15 +83,21 @@ enum CommandResult {
     Code(u8),
 }
 
-fn main() -> ExitCode {
-    match run() {
+fn main() {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref() == Some(OsStr::new(WINDOWS_HELPER_ARG)) {
+        windows_launch_helper();
+    }
+
+    let code = match run() {
         Ok(CommandResult::Status(status)) => status_exit_code(status),
-        Ok(CommandResult::Code(code)) => ExitCode::from(code),
+        Ok(CommandResult::Code(code)) => i32::from(code),
         Err(error) => {
             eprintln!("with-limits: {error:#}");
-            ExitCode::from(EXIT_WRAPPER_ERROR)
+            i32::from(EXIT_WRAPPER_ERROR)
         }
-    }
+    };
+    std::process::exit(code);
 }
 
 fn run() -> Result<CommandResult> {
@@ -103,11 +114,20 @@ fn run() -> Result<CommandResult> {
         cli.memory
     };
     let available = if matches!(memory_spec, Some(MemorySpec::AvailableFraction(_))) {
-        available_memory(&system)?
+        available_memory(&mut system)?
     } else {
         system.available_memory()
     };
-    let memory = memory_spec.map(|limit| limit.resolve(available));
+    let memory = memory_spec
+        .map(|limit| limit.resolve(available))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    let host_memory_reserve = match (memory_spec, memory) {
+        (Some(MemorySpec::AvailableFraction(_)), Some(limit)) => {
+            Some(available.saturating_sub(limit))
+        }
+        _ => None,
+    };
     let cpu = cli.cpu.map(|limit| limit.0);
     let mut command = build_command(&cli)?;
     command.env("WITH_LIMITS_ACTIVE", "1");
@@ -149,10 +169,19 @@ fn run() -> Result<CommandResult> {
         return Err(error).context("could not place command under resource control");
     }
 
-    supervise(&cli, memory, cpu, child, controller, &mut system)
+    supervise(
+        &cli,
+        memory,
+        host_memory_reserve,
+        cpu,
+        child,
+        controller,
+        &mut system,
+    )
 }
 
-fn available_memory(system: &System) -> Result<u64> {
+fn available_memory(system: &mut System) -> Result<u64> {
+    system.refresh_memory();
     let available = system.available_memory();
     if available > 0 {
         return Ok(available);
@@ -185,6 +214,9 @@ fn available_memory(system: &System) -> Result<u64> {
             })
             .and_then(|value| value.trim_end_matches('%').parse::<f64>().ok());
         if let (Some(total), Some(percent)) = (total, percent) {
+            if !(0.0..=100.0).contains(&percent) {
+                bail!("memory_pressure returned an invalid free-memory percentage");
+            }
             let available = (total as f64 * percent / 100.0) as u64;
             if available > 0 {
                 return Ok(available);
@@ -198,9 +230,14 @@ fn available_memory(system: &System) -> Result<u64> {
         let meminfo = std::fs::read_to_string("/proc/meminfo")
             .context("could not read /proc/meminfo to determine available memory")?;
         if let Some(kibibytes) = meminfo.lines().find_map(|line| {
-            line.strip_prefix("MemAvailable:")
-                .and_then(|rest| rest.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
+            let fields: Vec<_> = line
+                .strip_prefix("MemAvailable:")?
+                .split_whitespace()
+                .collect();
+            match fields.as_slice() {
+                [value, "kB"] => value.parse::<u64>().ok(),
+                _ => None,
+            }
         }) {
             if kibibytes > 0 {
                 return Ok(kibibytes.saturating_mul(1024));
@@ -214,6 +251,14 @@ fn available_memory(system: &System) -> Result<u64> {
 }
 
 fn build_command(cli: &Cli) -> Result<Command> {
+    let target = build_target_command(cli)?;
+    #[cfg(windows)]
+    return wrap_windows_command(target);
+    #[cfg(not(windows))]
+    Ok(target)
+}
+
+fn build_target_command(cli: &Cli) -> Result<Command> {
     if let Some(script) = &cli.shell_command {
         #[cfg(unix)]
         {
@@ -238,6 +283,75 @@ fn build_command(cli: &Cli) -> Result<Command> {
     let mut command = Command::new(program);
     command.args(arguments);
     Ok(command)
+}
+
+#[cfg(windows)]
+fn wrap_windows_command(target: Command) -> Result<Command> {
+    let mut command = Command::new(
+        std::env::current_exe().context("could not locate the with-limits executable")?,
+    );
+    command
+        .arg(WINDOWS_HELPER_ARG)
+        .arg(target.get_program())
+        .args(target.get_args());
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn windows_launch_helper() -> ! {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::{
+            ExitProcess, OpenEventW, WaitForSingleObject, EVENT_ALL_ACCESS, INFINITE,
+        },
+    };
+
+    let fail = |message: &str, code: u32| -> ! {
+        eprintln!("with-limits: {message}");
+        unsafe { ExitProcess(code) }
+    };
+    let gate_name = std::env::var(WINDOWS_GATE_ENV)
+        .unwrap_or_else(|_| fail("Windows launch helper did not receive its gate", 125));
+    let gate_name: Vec<u16> = gate_name.encode_utf16().chain(Some(0)).collect();
+    let gate = unsafe { OpenEventW(EVENT_ALL_ACCESS, 0, gate_name.as_ptr()) };
+    if gate.is_null() {
+        fail("Windows launch helper could not open its gate", 125);
+    }
+    let wait = unsafe { WaitForSingleObject(gate, INFINITE) };
+    unsafe { CloseHandle(gate) };
+    if wait != WAIT_OBJECT_0 {
+        fail("Windows launch helper could not wait for its gate", 125);
+    }
+
+    let mut args = std::env::args_os().skip(2);
+    let program = args
+        .next()
+        .unwrap_or_else(|| fail("Windows launch helper did not receive a command", 125));
+    let mut command = Command::new(&program);
+    command.args(args).env_remove(WINDOWS_GATE_ENV);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "with-limits: command not found: {}",
+                display_program(&program)
+            );
+            unsafe { ExitProcess(u32::from(EXIT_NOT_FOUND)) }
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            eprintln!(
+                "with-limits: cannot invoke {}: {error}",
+                display_program(&program)
+            );
+            unsafe { ExitProcess(u32::from(EXIT_CANNOT_INVOKE)) }
+        }
+        Err(error) => fail(&format!("could not start command: {error}"), 125),
+    };
+    let status = child
+        .wait()
+        .unwrap_or_else(|error| fail(&format!("could not wait for command: {error}"), 125));
+    let code = status.code().unwrap_or(i32::from(EXIT_WRAPPER_ERROR)) as u32;
+    unsafe { ExitProcess(code) }
 }
 
 #[cfg(unix)]
@@ -276,75 +390,191 @@ fn print_summary(cli: &Cli, memory: Option<u64>, controller: &platform::Controll
 fn supervise(
     cli: &Cli,
     memory: Option<u64>,
+    host_memory_reserve: Option<u64>,
     cpu: Option<f64>,
     mut child: Child,
-    controller: platform::Controller,
+    mut controller: platform::Controller,
     system: &mut System,
 ) -> Result<CommandResult> {
     let started = Instant::now();
-    let deadline = cli.time.map(|limit| started + limit.0);
-    let mut tree = ProcessTree::new(child.id());
+    let deadline = cli
+        .time
+        .map(|limit| {
+            started
+                .checked_add(limit.0)
+                .context("time limit is too large for the platform clock")
+        })
+        .transpose()?;
+    let mut tree = ProcessTree::new(child.id(), !cfg!(windows));
     let mut child_status = None;
+    let mut throttle = CpuThrottle::new();
+    let mut last_cpu_sample = started;
+    let mut cpu_sample_initialized = false;
+    let mut next_host_memory_check = started;
 
     loop {
-        let usage = tree.refresh(system);
+        let mut root_exited = false;
         if child_status.is_none() {
             child_status = child
                 .try_wait()
                 .context("could not inspect command status")?;
+            if child_status.is_some() {
+                root_exited = true;
+            }
+        }
+        let usage = tree.refresh(system);
+        if root_exited {
+            tree.retire_root();
+        }
+        let targets = tree.identities();
+        controller.set_targets(&targets)?;
+
+        if let Some(status) = child_status {
+            if cfg!(windows) || tree.is_empty() {
+                controller.disarm();
+                return Ok(CommandResult::Status(status));
+            }
+        } else if !tree.observed_root() {
+            child_status = child
+                .try_wait()
+                .context("could not recheck an unobserved command")?;
+            if let Some(status) = child_status {
+                controller.disarm();
+                return Ok(CommandResult::Status(status));
+            }
+            bail!("could not observe the running command in the process table");
         }
 
         if let Some(limit) = memory {
-            if !controller.memory_is_native() && usage.rss_bytes > limit {
+            if usage.rss_bytes > limit {
                 eprintln!(
                     "with-limits: memory limit exceeded ({} > {})",
                     format_bytes(usage.rss_bytes),
                     format_bytes(limit)
                 );
-                stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0);
+                stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0)?;
+                controller.disarm();
                 return Ok(CommandResult::Code(EXIT_MEMORY));
+            }
+        }
+
+        if let Some(reserve) = host_memory_reserve {
+            if reserve > 0 && Instant::now() >= next_host_memory_check {
+                let available = available_memory(system)?;
+                next_host_memory_check = Instant::now()
+                    .checked_add(Duration::from_secs(1))
+                    .context("platform clock cannot schedule memory sampling")?;
+                if available < reserve {
+                    eprintln!(
+                        "with-limits: host memory reserve crossed ({} available < {} reserved)",
+                        format_bytes(available),
+                        format_bytes(reserve)
+                    );
+                    stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0)?;
+                    controller.disarm();
+                    return Ok(CommandResult::Code(EXIT_MEMORY));
+                }
             }
         }
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             eprintln!("with-limits: time limit exceeded");
-            stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0);
+            stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0)?;
+            controller.disarm();
             return Ok(CommandResult::Code(EXIT_TIMEOUT));
-        }
-
-        if let Some(status) = child_status {
-            if tree.is_empty() {
-                return Ok(CommandResult::Status(status));
-            }
         }
 
         if let Some(cores) = cpu {
             if !controller.cpu_is_native() {
-                throttle_cpu(&controller, usage.cpu_percent, cores, cli.poll_interval.0);
+                if !cpu_sample_initialized {
+                    if let Err(error) = controller.suspend(&targets) {
+                        let _ = controller.resume(&targets);
+                        return Err(error);
+                    }
+                    sleep_until_or_deadline(
+                        sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(10),
+                        deadline,
+                    );
+                    tree.refresh(system);
+                    let targets = tree.identities();
+                    controller.set_targets(&targets)?;
+                    controller.resume(&targets)?;
+                    last_cpu_sample = Instant::now();
+                    cpu_sample_initialized = true;
+                    continue;
+                }
+                let now = Instant::now();
+                throttle.record(usage.cpu_percent, cores, now - last_cpu_sample)?;
+                last_cpu_sample = now;
+                throttle.pause(&controller, &targets, deadline)?;
+                if !throttle.pause_debt.is_zero() {
+                    continue;
+                }
             }
         }
         thread::sleep(cli.poll_interval.0);
     }
 }
 
-fn throttle_cpu(
-    controller: &platform::Controller,
-    observed_percent: f64,
-    cores: f64,
-    interval: Duration,
-) {
-    let allowed_percent = cores * 100.0;
-    if observed_percent <= allowed_percent || allowed_percent == 0.0 {
-        return;
+struct CpuThrottle {
+    pause_debt: Duration,
+}
+
+impl CpuThrottle {
+    fn new() -> Self {
+        Self {
+            pause_debt: Duration::ZERO,
+        }
     }
-    let pause = interval
-        .mul_f64(observed_percent / allowed_percent - 1.0)
-        .min(Duration::from_secs(1));
-    if !pause.is_zero() {
-        controller.suspend();
-        thread::sleep(pause);
-        controller.resume();
+
+    fn record(&mut self, observed_percent: f64, cores: f64, sample: Duration) -> Result<()> {
+        let allowed_percent = cores * 100.0;
+        if observed_percent <= allowed_percent {
+            return Ok(());
+        }
+        let added = Duration::try_from_secs_f64(
+            sample.as_secs_f64() * (observed_percent / allowed_percent - 1.0),
+        )
+        .context("CPU throttle interval is too large")?;
+        self.pause_debt = self
+            .pause_debt
+            .checked_add(added)
+            .context("CPU throttle debt overflowed")?;
+        Ok(())
     }
+
+    fn pause(
+        &mut self,
+        controller: &platform::Controller,
+        targets: &[process_tree::ProcessIdentity],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        let pause = self.pause_debt.min(Duration::from_secs(1));
+        if pause.is_zero() {
+            return Ok(());
+        }
+
+        if let Err(error) = controller.suspend(targets) {
+            let _ = controller.resume(targets);
+            return Err(error);
+        }
+        let result = sleep_until_or_deadline(pause, deadline);
+        let resume_result = controller.resume(targets);
+        self.pause_debt -= result;
+        resume_result
+    }
+}
+
+fn sleep_until_or_deadline(duration: Duration, deadline: Option<Instant>) -> Duration {
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
+    started.elapsed().min(duration)
 }
 
 fn stop_command(
@@ -353,41 +583,62 @@ fn stop_command(
     tree: &mut ProcessTree,
     system: &mut System,
     grace: Duration,
-) {
-    controller.terminate();
-    let deadline = Instant::now() + grace;
+) -> Result<()> {
+    tree.refresh(system);
+    let mut targets = tree.identities();
+    controller.set_targets(&targets)?;
+    controller.terminate(&targets)?;
+    let deadline = Instant::now()
+        .checked_add(grace)
+        .context("termination grace period is too large")?;
     while Instant::now() < deadline {
-        let _ = child.try_wait();
+        child
+            .try_wait()
+            .context("could not inspect command during termination")?;
         tree.refresh(system);
+        targets = tree.identities();
+        controller.set_targets(&targets)?;
         if tree.is_empty() {
-            return;
+            return Ok(());
         }
         thread::sleep(Duration::from_millis(25).min(grace));
     }
-    controller.kill();
-    let _ = child.wait();
+    targets = tree.identities();
+    controller.kill(&targets)?;
+    let verification_deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < verification_deadline {
+        child
+            .try_wait()
+            .context("could not inspect command after forced termination")?;
+        tree.refresh(system);
+        targets = tree.identities();
+        controller.set_targets(&targets)?;
+        if tree.is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    bail!(
+        "process tree still contains {} process(es) after forced termination",
+        targets.len()
+    )
 }
 
 #[cfg(unix)]
-fn status_exit_code(status: ExitStatus) -> ExitCode {
+fn status_exit_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
-        ExitCode::from(u8::try_from(code).unwrap_or(EXIT_WRAPPER_ERROR))
+        code
     } else if let Some(signal) = status.signal() {
-        ExitCode::from(u8::try_from(128 + signal).unwrap_or(EXIT_WRAPPER_ERROR))
+        128 + signal
     } else {
-        ExitCode::from(EXIT_WRAPPER_ERROR)
+        i32::from(EXIT_WRAPPER_ERROR)
     }
 }
 
 #[cfg(windows)]
-fn status_exit_code(status: ExitStatus) -> ExitCode {
-    ExitCode::from(
-        status
-            .code()
-            .and_then(|code| u8::try_from(code).ok())
-            .unwrap_or(EXIT_WRAPPER_ERROR),
-    )
+fn status_exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(i32::from(EXIT_WRAPPER_ERROR))
 }
 
 #[allow(dead_code)]
