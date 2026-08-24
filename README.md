@@ -15,14 +15,20 @@ work. Several agents can each start a RAM-intensive job that looks reasonable
 in isolation, while their combined memory use exhausts and crashes the host.
 Putting a process-tree limit around each job contains that failure.
 
-The entire child tree also runs at a fixed lower scheduling priority: niceness
-`+10` on Unix and Below Normal priority on Windows. This still lets a job use
-otherwise-idle CPU capacity while allowing interactive applications to win
-when they need it.
+The entire child tree also runs at a fixed lower scheduling priority. On Unix,
+its inherited niceness is increased by 10, capped at the maximum of 19. Windows
+uses Below Normal priority. This still lets a job use otherwise-idle CPU
+capacity while allowing interactive applications to win when they need it.
 
 For a time limit alone, GNU `timeout` (installed as `gtimeout` by Homebrew) is
 the established choice. `with-limits` is useful when one portable command
 should also constrain memory or sustained CPU consumption.
+
+## Status
+
+`with-limits` is an early-stage, actively maintained tool. Releases before 1.0
+may change command-line options, environment variables, and exit-status
+behavior.
 
 ## Installation
 
@@ -135,10 +141,10 @@ for the example, configuration, security tradeoff, and platform scope.
 
 `WITH_LIMITS_NICE` controls fixed priority lowering. It defaults to `10`. On
 Unix, values from `1` through `19` are added to the child process's inherited
-niceness; descendants inherit the result. On Windows, any enabled value selects
-the Below Normal priority class for the Job Object and therefore its entire
-process tree. Set it to `0`, `off`, `false`, or `no` to disable priority
-lowering.
+niceness, capped at 19; descendants inherit the result. On Windows, any enabled
+value selects the Below Normal priority class for the Job Object and therefore
+its entire process tree. Set it to `0`, `off`, `false`, or `no` to disable
+priority lowering.
 
 The priority does not change in response to load or the number of running
 agents. Fixed lower priority lets foreground work preempt background jobs while
@@ -213,6 +219,12 @@ These follow GNU `timeout` conventions where they overlap.
 - [`with-gpu`](https://github.com/osteele/with-gpu) selects and monitors a GPU
   for a command. It can be used alongside `with-limits` when a workload needs
   both GPU selection and host resource containment.
+
+## Questions and contributions
+
+Report bugs and ask usage questions in
+[GitHub Issues](https://github.com/osteele/with-limits/issues). Changes can be
+proposed with a pull request.
 
 ## License
 
