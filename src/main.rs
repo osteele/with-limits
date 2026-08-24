@@ -490,8 +490,15 @@ fn supervise(
     let mut last_cpu_sample = started;
     let mut cpu_sample_initialized = false;
     let mut next_host_memory_check = started;
+    #[cfg(unix)]
+    let mut external_termination = None;
 
     loop {
+        #[cfg(unix)]
+        if controller.wait_for_forwarded_signal(Duration::ZERO) {
+            record_external_termination(&mut external_termination, cli.kill_after.0)?;
+        }
+
         let mut root_exited = false;
         if child_status.is_none() {
             child_status = child
@@ -522,6 +529,32 @@ fn supervise(
                 return Ok(CommandResult::Status(status));
             }
             bail!("could not observe the running command in the process table");
+        }
+
+        #[cfg(unix)]
+        if external_termination.is_some_and(|termination| Instant::now() >= termination.deadline) {
+            force_command(&mut child, &controller, &mut tree, system)?;
+            controller.disarm();
+            let status = child
+                .wait()
+                .context("could not collect command after external termination")?;
+            return Ok(CommandResult::Status(status));
+        }
+
+        #[cfg(unix)]
+        if external_termination.is_some() {
+            let wait = external_termination
+                .map(|termination| {
+                    termination
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                })
+                .unwrap_or_default()
+                .min(cli.poll_interval.0);
+            if controller.wait_for_forwarded_signal(wait) {
+                record_external_termination(&mut external_termination, cli.kill_after.0)?;
+            }
+            continue;
         }
 
         if let Some(limit) = memory {
@@ -591,8 +624,33 @@ fn supervise(
                 }
             }
         }
+        #[cfg(unix)]
+        if controller.wait_for_forwarded_signal(cli.poll_interval.0) {
+            record_external_termination(&mut external_termination, cli.kill_after.0)?;
+        }
+        #[cfg(not(unix))]
         thread::sleep(cli.poll_interval.0);
     }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct ExternalTermination {
+    deadline: Instant,
+}
+
+#[cfg(unix)]
+fn record_external_termination(
+    termination: &mut Option<ExternalTermination>,
+    grace: Duration,
+) -> Result<()> {
+    if termination.is_none() {
+        let deadline = Instant::now()
+            .checked_add(grace)
+            .context("termination grace period is too large")?;
+        *termination = Some(ExternalTermination { deadline });
+    }
+    Ok(())
 }
 
 struct CpuThrottle {
@@ -690,7 +748,17 @@ fn stop_command(
         }
         thread::sleep(Duration::from_millis(25).min(grace));
     }
-    targets = tree.identities();
+    force_command(child, controller, tree, system)
+}
+
+fn force_command(
+    child: &mut Child,
+    controller: &platform::Controller,
+    tree: &mut ProcessTree,
+    system: &mut System,
+) -> Result<()> {
+    let mut targets = tree.identities();
+    controller.set_targets(&targets)?;
     controller.kill(&targets)?;
     let verification_deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < verification_deadline {

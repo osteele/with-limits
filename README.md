@@ -167,11 +167,12 @@ unrelated or concurrently guarded growth can stop the command before its own
 RSS reaches its ceiling.
 
 Signals sent to `with-limits` are forwarded to the Unix process group and to
-tracked descendants that have created another process group or session. On
-Unix, a limit first requests graceful termination, waits for `--kill-after`,
-and then forces termination if any tracked descendant remains. A Windows Job
-Object terminates the tree as a unit. If required monitoring or enforcement
-fails, `with-limits` stops the workload and exits with status 125.
+tracked descendants that have created another process group or session. After
+forwarding a signal, `with-limits` waits for `--kill-after` and forcibly
+terminates any tracked process that remains. Unix limit violations request
+graceful termination and use the same grace period. A Windows Job Object
+terminates the tree as a unit. If required monitoring or enforcement fails,
+`with-limits` stops the workload and exits with status 125.
 
 ## Exit status
 

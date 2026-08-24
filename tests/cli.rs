@@ -66,10 +66,14 @@ fn graceful_termination_helper() {
     if let Some(marker) = std::env::var_os("WITH_LIMITS_TEST_MARKER") {
         let terminated = Arc::new(AtomicBool::new(false));
         signal_hook::flag::register(libc::SIGTERM, Arc::clone(&terminated)).unwrap();
+        if let Some(ready) = std::env::var_os("WITH_LIMITS_TEST_READY") {
+            std::fs::write(ready, "ready").unwrap();
+        }
         while !terminated.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(10));
         }
         std::fs::write(marker, "terminated").unwrap();
+        std::process::exit(23);
     }
 }
 
@@ -347,9 +351,10 @@ fn forwards_external_termination_signals_to_the_command() {
             "500ms",
             "--poll-interval",
             "25ms",
-            "-c",
-            "trap 'printf forwarded > \"$WITH_LIMITS_TEST_MARKER\"; exit 23' TERM; printf ready > \"$WITH_LIMITS_TEST_READY\"; while :; do sleep 1; done",
+            "--",
         ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "graceful_termination_helper"])
         .env("WITH_LIMITS_TEST_READY", &ready)
         .env("WITH_LIMITS_TEST_MARKER", &marker)
         .spawn()
@@ -368,9 +373,72 @@ fn forwards_external_termination_signals_to_the_command() {
     let status = child.wait().unwrap();
 
     assert_eq!(status.code(), Some(23));
-    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "forwarded");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "terminated");
     let _ = std::fs::remove_file(ready);
     let _ = std::fs::remove_file(marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn forces_an_externally_terminated_command_that_ignores_sigterm() {
+    let _guard = resource_test_guard();
+    let ready = temp_path("ignored-sigterm-ready");
+    let script = format!(
+        "trap '' TERM; printf '%s' $$ > {:?}; while :; do sleep 1; done",
+        ready
+    );
+    let mut child = binary()
+        .args([
+            "--time",
+            "10s",
+            "--kill-after",
+            "100ms",
+            "--poll-interval",
+            "3s",
+            "-c",
+            &script,
+        ])
+        .spawn()
+        .unwrap();
+
+    let ready_deadline = Instant::now() + Duration::from_secs(2);
+    while !ready.exists() && Instant::now() < ready_deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !ready.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("command did not become ready for external termination");
+    }
+    let command_pid: i32 = std::fs::read_to_string(&ready)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+
+    let exit_deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= exit_deadline {
+            unsafe { libc::kill(-command_pid, libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&ready);
+            panic!("with-limits did not force termination after --kill-after");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let survived = unsafe { libc::kill(command_pid, 0) } == 0;
+    if survived {
+        unsafe { libc::kill(-command_pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(ready);
+    assert_eq!(status.code(), Some(137));
+    assert!(!survived, "command survived forced external termination");
 }
 
 #[cfg(windows)]

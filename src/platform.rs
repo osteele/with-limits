@@ -11,14 +11,20 @@ mod imp {
     use std::{
         io,
         os::unix::process::CommandExt,
-        sync::{Arc, RwLock},
+        sync::{
+            mpsc::{self, Receiver, RecvTimeoutError, Sender},
+            Arc, RwLock,
+        },
         thread,
+        time::Duration,
     };
 
     pub struct Controller {
         pgid: i32,
         targets: Arc<RwLock<Vec<ProcessIdentity>>>,
         signals: Option<Signals>,
+        signal_sender: Option<Sender<()>>,
+        forwarded_signals: Receiver<()>,
         armed: bool,
     }
 
@@ -37,10 +43,13 @@ mod imp {
                 }
             }
             let signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+            let (signal_sender, forwarded_signals) = mpsc::channel();
             Ok(Self {
                 pgid: 0,
                 targets: Arc::new(RwLock::new(Vec::new())),
                 signals: Some(signals),
+                signal_sender: Some(signal_sender),
+                forwarded_signals,
                 armed: true,
             })
         }
@@ -56,6 +65,10 @@ mod imp {
                 .signals
                 .take()
                 .context("signal forwarding is already attached")?;
+            let signal_sender = self
+                .signal_sender
+                .take()
+                .context("signal notification is already attached")?;
             thread::spawn(move || {
                 for signal in signals.forever() {
                     let current = targets
@@ -65,9 +78,17 @@ mod imp {
                     if let Err(error) = signal_processes(pgid, &current, signal) {
                         eprintln!("with-limits: could not forward signal {signal}: {error:#}");
                     }
+                    let _ = signal_sender.send(());
                 }
             });
             Ok(())
+        }
+
+        pub fn wait_for_forwarded_signal(&self, timeout: Duration) -> bool {
+            match self.forwarded_signals.recv_timeout(timeout) {
+                Ok(()) => true,
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => false,
+            }
         }
 
         pub fn set_targets(&self, targets: &[ProcessIdentity]) -> Result<()> {

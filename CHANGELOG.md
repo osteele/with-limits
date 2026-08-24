@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Force externally signaled Unix process trees to stop after `--kill-after` when they ignore graceful termination
+
 ## [0.1.0] - 2026-08-23
 
 ### Added
