@@ -6,7 +6,9 @@ use std::process::{Child, Command};
 mod imp {
     use super::*;
     use anyhow::{bail, Context};
-    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::consts::signal::{
+        SIGCONT, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGTSTP, SIGUSR1, SIGUSR2, SIGWINCH,
+    };
     use signal_hook::iterator::Signals;
     use std::{
         io,
@@ -42,7 +44,9 @@ mod imp {
                     command.pre_exec(move || lower_priority(adjustment));
                 }
             }
-            let signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
+            let signals = Signals::new([
+                SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2, SIGWINCH, SIGTSTP, SIGCONT,
+            ])?;
             let (signal_sender, forwarded_signals) = mpsc::channel();
             Ok(Self {
                 pgid: 0,
@@ -60,6 +64,8 @@ mod imp {
                 bail!("refusing unsafe child process group {}", self.pgid);
             }
             let pgid = self.pgid;
+            let supervisor_pid =
+                i32::try_from(std::process::id()).context("supervisor PID is too large")?;
             let targets = Arc::clone(&self.targets);
             let mut signals = self
                 .signals
@@ -78,7 +84,15 @@ mod imp {
                     if let Err(error) = signal_processes(pgid, &current, signal) {
                         eprintln!("with-limits: could not forward signal {signal}: {error:#}");
                     }
-                    let _ = signal_sender.send(());
+                    if matches!(signal, SIGHUP | SIGINT | SIGQUIT | SIGTERM) {
+                        let _ = signal_sender.send(());
+                    } else if signal == SIGTSTP {
+                        // The installed handler suppresses SIGTSTP's default action.
+                        // Stop only after the command tree has received the signal.
+                        if let Err(error) = signal_one(supervisor_pid, libc::SIGSTOP) {
+                            eprintln!("with-limits: could not stop after SIGTSTP: {error:#}");
+                        }
+                    }
                 }
             });
             Ok(())

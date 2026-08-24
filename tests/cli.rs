@@ -77,6 +77,72 @@ fn graceful_termination_helper() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn passthrough_signal_helper() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let Some(ready) = std::env::var_os("WITH_LIMITS_TEST_READY") else {
+        return;
+    };
+    let marker = std::env::var_os("WITH_LIMITS_TEST_MARKER").unwrap();
+    let terminated = Arc::new(AtomicBool::new(false));
+    let usr1 = Arc::new(AtomicBool::new(false));
+    let usr2 = Arc::new(AtomicBool::new(false));
+    let winch = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(libc::SIGTERM, Arc::clone(&terminated)).unwrap();
+    signal_hook::flag::register(libc::SIGUSR1, Arc::clone(&usr1)).unwrap();
+    signal_hook::flag::register(libc::SIGUSR2, Arc::clone(&usr2)).unwrap();
+    signal_hook::flag::register(libc::SIGWINCH, Arc::clone(&winch)).unwrap();
+    std::fs::write(ready, std::process::id().to_string()).unwrap();
+
+    let mut recorded = false;
+    while !terminated.load(Ordering::Relaxed) {
+        if !recorded
+            && usr1.load(Ordering::Relaxed)
+            && usr2.load(Ordering::Relaxed)
+            && winch.load(Ordering::Relaxed)
+        {
+            std::fs::write(&marker, "forwarded").unwrap();
+            recorded = true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::process::exit(23);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn job_control_helper() {
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+
+    let Some(ready) = std::env::var_os("WITH_LIMITS_TEST_READY") else {
+        return;
+    };
+    let marker = std::env::var_os("WITH_LIMITS_TEST_MARKER").unwrap();
+    let terminated = Arc::new(AtomicBool::new(false));
+    let continued = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(libc::SIGTERM, Arc::clone(&terminated)).unwrap();
+    signal_hook::flag::register(libc::SIGCONT, Arc::clone(&continued)).unwrap();
+    std::fs::write(ready, std::process::id().to_string()).unwrap();
+
+    while !terminated.load(Ordering::Relaxed) {
+        if continued.swap(false, Ordering::Relaxed) {
+            std::fs::write(&marker, "continued").unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::process::exit(23);
+}
+
 #[test]
 #[ignore]
 fn priority_tree_helper() {
@@ -381,11 +447,22 @@ fn forwards_external_termination_signals_to_the_command() {
 #[cfg(unix)]
 #[test]
 fn forces_an_externally_terminated_command_that_ignores_sigterm() {
+    assert_forces_ignored_signal(libc::SIGTERM, "TERM", "sigterm");
+}
+
+#[cfg(unix)]
+#[test]
+fn forces_an_externally_terminated_command_that_ignores_sigquit() {
+    assert_forces_ignored_signal(libc::SIGQUIT, "QUIT", "sigquit");
+}
+
+#[cfg(unix)]
+fn assert_forces_ignored_signal(signal: i32, shell_signal: &str, label: &str) {
     let _guard = resource_test_guard();
-    let ready = temp_path("ignored-sigterm-ready");
+    let ready = temp_path(&format!("ignored-{label}-ready"));
     let script = format!(
-        "trap '' TERM; printf '%s' $$ > {:?}; while :; do sleep 1; done",
-        ready
+        "trap '' {shell_signal}; printf '%s' $$ > {:?}; while :; do sleep 1; done",
+        ready,
     );
     let mut child = binary()
         .args([
@@ -415,7 +492,7 @@ fn forces_an_externally_terminated_command_that_ignores_sigterm() {
         .trim()
         .parse()
         .unwrap();
-    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
 
     let exit_deadline = Instant::now() + Duration::from_secs(2);
     let status = loop {
@@ -439,6 +516,89 @@ fn forces_an_externally_terminated_command_that_ignores_sigterm() {
     let _ = std::fs::remove_file(ready);
     assert_eq!(status.code(), Some(137));
     assert!(!survived, "command survived forced external termination");
+}
+
+#[cfg(unix)]
+#[test]
+fn forwards_application_signals_without_starting_termination() {
+    let _guard = resource_test_guard();
+    let ready = temp_path("passthrough-ready");
+    let marker = temp_path("passthrough-marker");
+    let mut child = binary()
+        .args([
+            "--time",
+            "5s",
+            "--kill-after",
+            "100ms",
+            "--poll-interval",
+            "3s",
+            "--",
+        ])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "passthrough_signal_helper"])
+        .env("WITH_LIMITS_TEST_READY", &ready)
+        .env("WITH_LIMITS_TEST_MARKER", &marker)
+        .spawn()
+        .unwrap();
+
+    assert!(wait_for_path(&ready, Duration::from_secs(2)));
+    let command_pid = read_pid(&ready);
+    for signal in [libc::SIGUSR1, libc::SIGUSR2, libc::SIGWINCH] {
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    }
+    if !wait_for_path(&marker, Duration::from_secs(2)) {
+        cleanup_processes(&mut child, command_pid);
+        panic!("command did not receive every pass-through signal");
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    if let Some(status) = child.try_wait().unwrap() {
+        cleanup_processes(&mut child, command_pid);
+        panic!("pass-through signal stopped with-limits with {status}");
+    }
+
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = child.wait().unwrap();
+    let _ = std::fs::remove_file(ready);
+    let _ = std::fs::remove_file(marker);
+    assert_eq!(status.code(), Some(23));
+}
+
+#[cfg(unix)]
+#[test]
+fn forwards_job_control_to_the_command_tree() {
+    let _guard = resource_test_guard();
+    let ready = temp_path("job-control-ready");
+    let marker = temp_path("job-control-marker");
+    let mut child = binary()
+        .args(["--time", "5s", "--poll-interval", "25ms", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "job_control_helper"])
+        .env("WITH_LIMITS_TEST_READY", &ready)
+        .env("WITH_LIMITS_TEST_MARKER", &marker)
+        .spawn()
+        .unwrap();
+
+    assert!(wait_for_path(&ready, Duration::from_secs(2)));
+    let command_pid = read_pid(&ready);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTSTP) }, 0);
+    if !wait_for_stopped_child(child.id() as i32, Duration::from_secs(2))
+        || !wait_for_stopped_process(command_pid, Duration::from_secs(2))
+    {
+        unsafe { libc::kill(child.id() as i32, libc::SIGCONT) };
+        cleanup_processes(&mut child, command_pid);
+        panic!("SIGTSTP did not stop both supervisor and command");
+    }
+
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGCONT) }, 0);
+    if !wait_for_path(&marker, Duration::from_secs(2)) {
+        cleanup_processes(&mut child, command_pid);
+        panic!("command did not receive SIGCONT");
+    }
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+    let status = child.wait().unwrap();
+    let _ = std::fs::remove_file(ready);
+    let _ = std::fs::remove_file(marker);
+    assert_eq!(status.code(), Some(23));
 }
 
 #[cfg(windows)]
@@ -510,6 +670,79 @@ fn temp_path(label: &str) -> std::path::PathBuf {
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
     ))
+}
+
+#[cfg(unix)]
+fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    path.exists()
+}
+
+#[cfg(unix)]
+fn read_pid(path: &std::path::Path) -> i32 {
+    std::fs::read_to_string(path)
+        .expect("read helper PID")
+        .trim()
+        .parse()
+        .expect("parse helper PID")
+}
+
+#[cfg(unix)]
+fn cleanup_processes(child: &mut std::process::Child, command_pid: i32) {
+    if command_pid > 1 {
+        // SAFETY: command_pid was written by the test helper. The negative PID
+        // addresses the helper's process group, which with-limits created.
+        unsafe {
+            libc::kill(-command_pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn wait_for_stopped_child(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let mut status = 0;
+        // SAFETY: status points to writable memory and pid names our child.
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | libc::WUNTRACED) };
+        if result == pid && libc::WIFSTOPPED(status) {
+            return true;
+        }
+        if result == -1 {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+#[cfg(unix)]
+fn wait_for_stopped_process(pid: i32, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    let pid = pid.to_string();
+    while Instant::now() < deadline {
+        let output = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid])
+            .output()
+            .expect("inspect helper process state");
+        if output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('T')
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
 }
 
 fn assert_tree_priority(nice: Option<&str>, expected: i64) {

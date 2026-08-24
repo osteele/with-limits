@@ -172,13 +172,16 @@ additionally enforce the unallocated share as a host-memory reserve, so
 unrelated or concurrently guarded growth can stop the command before its own
 RSS reaches its ceiling.
 
-Signals sent to `with-limits` are forwarded to the Unix process group and to
-tracked descendants that have created another process group or session. After
-forwarding a signal, `with-limits` waits for `--kill-after` and forcibly
-terminates any tracked process that remains. Unix limit violations request
-graceful termination and use the same grace period. A Windows Job Object
-terminates the tree as a unit. If required monitoring or enforcement fails,
-`with-limits` stops the workload and exits with status 125.
+On Unix, terminating signals `SIGHUP`, `SIGINT`, `SIGQUIT`, and `SIGTERM` sent
+to `with-limits` are forwarded to the command's process group and to tracked
+descendants that have created another process group or session. `with-limits`
+then waits for `--kill-after` and forcibly terminates any tracked process that
+remains. `SIGUSR1`, `SIGUSR2`, and `SIGWINCH` are forwarded without starting
+termination. `SIGTSTP` stops the command tree and supervisor; `SIGCONT` resumes
+and is forwarded to the tree. Unix limit violations request graceful
+termination and use the same grace period. A Windows Job Object terminates the
+tree as a unit. If required monitoring or enforcement fails, `with-limits`
+stops the workload and exits with status 125.
 
 ## Exit status
 
