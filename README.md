@@ -113,6 +113,67 @@ Options:
 - `--quiet`, `-q` suppresses the interactive startup summary. Limit violations
   are still reported.
 
+## Admission gate
+
+Containment limits a command after it starts. The admission gate answers the
+earlier question of whether to start one at all, so several independent agents
+can consult the same host policy instead of each keeping its own copy. The
+resource that exhausts first on a machine running many agents is RAM, so the
+gate is built on memory signals: CPU load is the symptom of paging, and a load
+threshold fires late and on the wrong quantity.
+
+Three signals feed the decision. The kernel memory pressure level (1 normal,
+2 warn, 4 critical) is read on macOS from `kern.memorystatus_vm_pressure_level`
+and on Linux derived from the PSI `/proc/pressure/memory` stall time — a
+mapping onto the macOS scale chosen for this tool, not a kernel verdict; it is
+unknown on Windows. Swap free and swap total are read on every platform. The
+one-minute load average per logical CPU is read on macOS and Linux and is
+unknown on Windows; it is reported but not enforced unless a ceiling is set.
+Available memory and its fraction of total are reported alongside.
+
+A swap total of zero is exempt from the swap floor: macOS allocates swap
+lazily, so zero total is swap that was never needed, not swap that is
+exhausted; the pressure signal guards that interval.
+
+Every signal is optional. A platform that cannot answer, a failed sysctl, or
+an unparsable file yields an unknown for that signal only, and unknown is
+never replaced by a fabricated value. An unknown signal is reported by name
+but does not refuse, because whether "cannot tell" is a refusal is the
+caller's policy; `--refuse-unknown` treats an unknown enforced signal as a
+refusal for the caller that wants that.
+
+`with-limits --check-headroom` reads the signals, applies the policy, prints
+one line per signal, and exits `0` when admitted or `75` (`EX_TEMPFAIL`) when
+refused. `--json` prints the readings, the effective policy, the refusing
+reasons, and the unknown signals as one JSON object instead:
+
+```sh
+with-limits --check-headroom
+with-limits --check-headroom --json
+```
+
+`with-limits --wait-for-headroom[=DURATION] [limits] -- command` polls the
+same decision until admitted, then runs the command under the given limits.
+The wait is unbounded without a DURATION; with one, expiry exits `75` without
+running the command. Polls back off from 15 seconds by a factor of 1.5 with a
+random multiplier in `[0.5, 1.5)`, capped at 90 seconds per sleep. The jitter
+matters because dozens of agent sessions poll independently: a fixed backoff
+makes them retry in lockstep and start together the moment pressure clears.
+While waiting, a line naming the refusing signals goes to stderr on the first
+refusal and at most once a minute, unless `--quiet`. A terminating signal
+during the wait ends it, since no command is running yet.
+
+The wait never implies a limit and a limit never implies a wait; with no
+limit options the default `--memory auto` applies as usual.
+
+- `--max-pressure N` sets the highest admitted pressure level. The default is
+  `1`, so only normal pressure admits.
+- `--min-swap-free SIZE` sets the swap floor as an absolute size (percentages
+  are not accepted). The default is `1GiB`; `0` disables the floor.
+- `--max-load-per-cpu CORES` enforces a load ceiling. Without it, load is
+  reported but never refuses.
+- `--refuse-unknown` treats an unknown enforced signal as a refusal.
+
 ## Agent hooks
 
 Agent lifecycle hooks can place selected shell workloads under `with-limits`
@@ -149,6 +210,11 @@ priority lowering.
 The priority does not change in response to load or the number of running
 agents. Fixed lower priority lets foreground work preempt background jobs while
 leaving idle CPU capacity available to them.
+
+`WITH_LIMITS_MAX_PRESSURE`, `WITH_LIMITS_MIN_SWAP_FREE`, and
+`WITH_LIMITS_MAX_LOAD_PER_CPU` set the admission-gate thresholds and accept
+the same values as `--max-pressure`, `--min-swap-free`, and
+`--max-load-per-cpu`. The flags take precedence over the environment.
 
 ## Enforcement
 
@@ -190,6 +256,7 @@ the result:
 
 | Status | Meaning |
 | ---: | --- |
+| `75` | headroom was refused or the wait for it expired |
 | `124` | wall-clock limit expired |
 | `125` | `with-limits` could not supervise the command |
 | `126` | command was found but could not be invoked |

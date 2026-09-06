@@ -601,6 +601,108 @@ fn forwards_job_control_to_the_command_tree() {
     assert_eq!(status.code(), Some(23));
 }
 
+#[test]
+fn check_headroom_json_reports_every_signal_and_matches_the_exit_status() {
+    let output = binary()
+        .args(["--check-headroom", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.code().is_some());
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("the JSON report did not parse");
+    for key in [
+        "pressure_level",
+        "swap_free_bytes",
+        "swap_total_bytes",
+        "load_per_cpu",
+        "available_bytes",
+        "available_fraction",
+    ] {
+        assert!(
+            report["readings"].get(key).is_some(),
+            "readings is missing {key}"
+        );
+    }
+    for key in [
+        "max_pressure",
+        "min_swap_free_bytes",
+        "max_load_per_cpu",
+        "refuse_unknown",
+    ] {
+        assert!(
+            report["policy"].get(key).is_some(),
+            "policy is missing {key}"
+        );
+    }
+    assert!(report["refusing"].is_array());
+    assert!(report["unknown"].is_array());
+    let admitted = report["admitted"]
+        .as_bool()
+        .expect("admitted is not a boolean");
+    let expected = if admitted { 0 } else { 75 };
+    assert_eq!(output.status.code(), Some(expected));
+}
+
+#[test]
+fn check_headroom_rejects_a_command() {
+    for args in [
+        vec!["--check-headroom", "--", "true"],
+        vec!["--check-headroom", "-c", "exit 0"],
+    ] {
+        let output = binary().args(&args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "accepted {args:?}");
+    }
+}
+
+#[test]
+fn rejects_combining_check_and_wait_forms() {
+    let output = binary()
+        .args(["--check-headroom", "--wait-for-headroom=1s", "-c", "exit 0"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+#[test]
+fn wait_for_headroom_expires_without_running_the_command() {
+    // --max-pressure 0 refuses every known pressure level, and
+    // --refuse-unknown turns an unknown level into a refusal, so this policy
+    // cannot admit on any platform. Exit 75 rather than the command's 7
+    // proves the command never ran.
+    let output = binary()
+        .args([
+            "--wait-for-headroom=1ms",
+            "--max-pressure",
+            "0",
+            "--refuse-unknown",
+            "-c",
+            exit_command(7),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(75));
+}
+
+#[test]
+fn wait_for_headroom_runs_the_command_once_admitted() {
+    // No known pressure level exceeds 4, a floor of zero never refuses, and
+    // unknown signals do not refuse without --refuse-unknown, so this policy
+    // admits on the first poll on every platform.
+    let status = binary()
+        .args([
+            "--wait-for-headroom=1s",
+            "--max-pressure",
+            "4",
+            "--min-swap-free",
+            "0",
+            "-c",
+            exit_command(7),
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(7));
+}
+
 #[cfg(windows)]
 #[test]
 fn preserves_windows_exit_codes_above_255() {

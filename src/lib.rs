@@ -1,3 +1,5 @@
+pub mod headroom;
+
 use std::{fmt, str::FromStr, time::Duration};
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -12,8 +12,13 @@ use std::{
     time::{Duration, Instant},
 };
 use sysinfo::System;
-use with_limits::{format_bytes, CpuLimit, HumanDuration, MemorySpec};
+use with_limits::{
+    format_bytes,
+    headroom::{self, Policy, Readings, Verdict},
+    CpuLimit, HumanDuration, MemorySpec,
+};
 
+const EXIT_HEADROOM_REFUSED: u8 = 75; // EX_TEMPFAIL: refused now, try again later
 const EXIT_TIMEOUT: u8 = 124;
 const EXIT_WRAPPER_ERROR: u8 = 125;
 const EXIT_CANNOT_INVOKE: u8 = 126;
@@ -72,6 +77,59 @@ struct Cli {
     #[arg(short, long)]
     quiet: bool,
 
+    /// Report host headroom and the admission decision, then exit without
+    /// running a command
+    #[arg(
+        long,
+        conflicts_with_all = ["shell_command", "command", "wait_for_headroom"]
+    )]
+    check_headroom: bool,
+
+    /// Emit the --check-headroom report as one JSON object on stdout
+    #[arg(long, requires = "check_headroom")]
+    json: bool,
+
+    /// Wait for host headroom before starting the command. Without a DURATION
+    /// the wait is unbounded; with one, expiry exits 75 without running the
+    /// command
+    #[arg(long, value_name = "DURATION", num_args = 0..=1, require_equals = true)]
+    wait_for_headroom: Option<Option<HumanDuration>>,
+
+    /// Highest admitted kernel memory pressure level (1 normal, 2 warn,
+    /// 4 critical)
+    #[arg(
+        long,
+        value_name = "N",
+        env = "WITH_LIMITS_MAX_PRESSURE",
+        default_value = "1"
+    )]
+    max_pressure: i32,
+
+    /// Lowest admitted free swap once swap exists. A swap total of zero is
+    /// swap that was never needed and is exempt from the floor
+    #[arg(
+        long,
+        value_name = "SIZE",
+        env = "WITH_LIMITS_MIN_SWAP_FREE",
+        default_value = "1GiB",
+        value_parser = parse_swap_floor
+    )]
+    min_swap_free: u64,
+
+    /// Highest admitted one-minute load average per logical CPU. Load is
+    /// reported but not enforced without this flag
+    #[arg(
+        long,
+        value_name = "CORES",
+        env = "WITH_LIMITS_MAX_LOAD_PER_CPU",
+        value_parser = parse_load_ceiling
+    )]
+    max_load_per_cpu: Option<f64>,
+
+    /// Treat an unknown enforced signal as a refusal in the headroom forms
+    #[arg(long)]
+    refuse_unknown: bool,
+
     #[arg(long, hide = true, default_value = "250ms")]
     poll_interval: HumanDuration,
 
@@ -110,12 +168,21 @@ fn main() {
 
 fn run() -> Result<CommandResult> {
     let cli = Cli::parse();
+    if cli.check_headroom {
+        return check_headroom(&cli);
+    }
     if cli.shell_command.is_none() && cli.command.is_empty() {
         bail!("specify a command after --, or use -c");
     }
 
     let mut system = System::new_all();
     system.refresh_memory();
+    if let Some(max_wait) = cli.wait_for_headroom {
+        if let Some(result) = wait_for_admission(&cli, &mut system, max_wait.map(|limit| limit.0))?
+        {
+            return Ok(result);
+        }
+    }
     let memory_spec = if cli.memory.is_none() && cli.cpu.is_none() && cli.time.is_none() {
         Some(MemorySpec::AvailableFraction(0.7))
     } else {
@@ -201,6 +268,197 @@ fn resolve_memory_budget(spec: Option<MemorySpec>, available: u64) -> Result<Mem
 
 fn host_reserve_crossed(reserve: u64, available: u64) -> bool {
     reserve > 0 && available < reserve
+}
+
+fn admission_policy(cli: &Cli) -> Policy {
+    Policy {
+        max_pressure: cli.max_pressure,
+        min_swap_free_bytes: cli.min_swap_free,
+        max_load_per_cpu: cli.max_load_per_cpu,
+        refuse_unknown: cli.refuse_unknown,
+    }
+}
+
+fn check_headroom(cli: &Cli) -> Result<CommandResult> {
+    let policy = admission_policy(cli);
+    let mut system = System::new_all();
+    let readings = Readings::collect(&mut system);
+    let verdict = headroom::decide(&readings, &policy);
+    if cli.json {
+        print_json_report(&readings, &policy, &verdict)?;
+    } else {
+        print_human_report(&readings, &policy, &verdict);
+    }
+    Ok(CommandResult::Code(if verdict.admitted {
+        0
+    } else {
+        EXIT_HEADROOM_REFUSED
+    }))
+}
+
+#[derive(serde::Serialize)]
+struct HeadroomReport<'a> {
+    readings: &'a Readings,
+    policy: &'a Policy,
+    refusing: &'a [String],
+    unknown: &'a [&'static str],
+    admitted: bool,
+}
+
+fn print_json_report(readings: &Readings, policy: &Policy, verdict: &Verdict) -> Result<()> {
+    let report = HeadroomReport {
+        readings,
+        policy,
+        refusing: &verdict.refusing,
+        unknown: &verdict.unknown,
+        admitted: verdict.admitted,
+    };
+    let json = serde_json::to_string(&report).context("could not serialize the headroom report")?;
+    println!("{json}");
+    Ok(())
+}
+
+fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
+    let unknown_outcome = |enforced: bool| {
+        if policy.refuse_unknown && enforced {
+            "refuses (unknown)"
+        } else {
+            "reported (unknown)"
+        }
+    };
+    match readings.pressure_level {
+        Some(level) => println!(
+            "pressure level {level} ({}), maximum {}: {}",
+            headroom::pressure_name(level),
+            policy.max_pressure,
+            if level > policy.max_pressure {
+                "refuses"
+            } else {
+                "ok"
+            }
+        ),
+        None => println!("pressure level unknown: {}", unknown_outcome(true)),
+    }
+    match (readings.swap_free_bytes, readings.swap_total_bytes) {
+        (Some(free), Some(0)) => println!(
+            "swap free {}, no swap allocated: ok (the floor is exempt)",
+            format_bytes(free)
+        ),
+        (Some(free), Some(total)) => println!(
+            "swap free {} of {} total, floor {}: {}",
+            format_bytes(free),
+            format_bytes(total),
+            format_bytes(policy.min_swap_free_bytes),
+            if free < policy.min_swap_free_bytes {
+                "refuses"
+            } else {
+                "ok"
+            }
+        ),
+        _ => println!("swap free unknown: {}", unknown_outcome(true)),
+    }
+    match (readings.load_per_cpu, policy.max_load_per_cpu) {
+        (Some(load), Some(ceiling)) => println!(
+            "load per CPU {load:.2}, ceiling {ceiling}: {}",
+            if load > ceiling { "refuses" } else { "ok" }
+        ),
+        (Some(load), None) => println!("load per CPU {load:.2}: reported (no ceiling set)"),
+        (None, ceiling) => println!(
+            "load per CPU unknown: {}",
+            unknown_outcome(ceiling.is_some())
+        ),
+    }
+    match (readings.available_bytes, readings.available_fraction) {
+        (Some(bytes), Some(fraction)) => println!(
+            "available memory {} ({:.0}% of total): reported",
+            format_bytes(bytes),
+            fraction * 100.0
+        ),
+        _ => println!("available memory unknown: reported"),
+    }
+    if verdict.admitted {
+        println!("admitted");
+    } else {
+        println!("refused: {}", verdict.refusing.join("; "));
+    }
+}
+
+/// Poll the admission decision until admitted, then let the caller proceed to
+/// run the command. No signal handler is installed during the wait, so a
+/// terminating signal ends the process with the default disposition, as it
+/// does for any interrupted wrapper.
+fn wait_for_admission(
+    cli: &Cli,
+    system: &mut System,
+    max_wait: Option<Duration>,
+) -> Result<Option<CommandResult>> {
+    let policy = admission_policy(cli);
+    let started = Instant::now();
+    let mut attempt = 0_u32;
+    let mut last_notice: Option<Instant> = None;
+    loop {
+        let readings = Readings::collect(system);
+        let verdict = headroom::decide(&readings, &policy);
+        if verdict.admitted {
+            if last_notice.is_some() && !cli.quiet {
+                eprintln!(
+                    "with-limits: headroom admitted after {:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            return Ok(None);
+        }
+        let elapsed = started.elapsed();
+        if let Some(limit) = max_wait {
+            if elapsed >= limit {
+                eprintln!(
+                    "with-limits: headroom wait expired after {}: {}",
+                    HumanDuration(limit),
+                    verdict.refusing.join("; ")
+                );
+                return Ok(Some(CommandResult::Code(EXIT_HEADROOM_REFUSED)));
+            }
+        }
+        if !cli.quiet && last_notice.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+            eprintln!(
+                "with-limits: waiting for headroom: {}",
+                verdict.refusing.join("; ")
+            );
+            last_notice = Some(Instant::now());
+        }
+        let mut sleep = headroom::backoff_sleep(attempt, headroom::jitter_sample());
+        if let Some(limit) = max_wait {
+            sleep = sleep.min(limit.saturating_sub(elapsed));
+        }
+        thread::sleep(sleep);
+        attempt += 1;
+    }
+}
+
+/// Parse the swap floor: an absolute size, or zero to disable the floor.
+/// Percentages and `auto` resolve against available memory, which is not the
+/// quantity the floor constrains, so they are rejected here.
+fn parse_swap_floor(value: &str) -> Result<u64, String> {
+    if value.trim() == "0" {
+        return Ok(0);
+    }
+    match value.parse::<MemorySpec>()? {
+        MemorySpec::Bytes(bytes) => Ok(bytes),
+        MemorySpec::AvailableFraction(_) => {
+            Err("the swap floor takes an absolute size, not a percentage or auto".into())
+        }
+    }
+}
+
+fn parse_load_ceiling(value: &str) -> Result<f64, String> {
+    let ceiling = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("invalid load ceiling {value:?}"))?;
+    if !ceiling.is_finite() || ceiling <= 0.0 {
+        return Err("the load ceiling must be positive".into());
+    }
+    Ok(ceiling)
 }
 
 fn configured_nice_adjustment() -> Result<Option<i32>> {
@@ -931,6 +1189,31 @@ mod tests {
                 host_reserve: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_swap_floor_sizes_but_not_fractions() {
+        assert_eq!(parse_swap_floor("0").unwrap(), 0);
+        assert_eq!(parse_swap_floor("2GiB").unwrap(), 2 << 30);
+        assert_eq!(parse_swap_floor("1.5 GB").unwrap(), 1_500_000_000);
+        for value in ["", "50%", "auto", "-1", "0.5", "1XB"] {
+            assert!(
+                parse_swap_floor(value).is_err(),
+                "unexpectedly accepted {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_positive_load_ceilings() {
+        assert_eq!(parse_load_ceiling("0.9").unwrap(), 0.9);
+        assert_eq!(parse_load_ceiling(" 4 ").unwrap(), 4.0);
+        for value in ["", "0", "-1", "abc", "NaN", "inf"] {
+            assert!(
+                parse_load_ceiling(value).is_err(),
+                "unexpectedly accepted {value:?}"
+            );
+        }
     }
 
     #[test]
