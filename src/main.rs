@@ -105,8 +105,8 @@ struct Cli {
     )]
     max_pressure: i32,
 
-    /// Lowest admitted free swap once swap exists. A swap total of zero is
-    /// swap that was never needed and is exempt from the floor
+    /// Lowest admitted free swap once swap has grown past this size. A swap
+    /// total at or below it is swap the system has barely touched and is exempt
     #[arg(
         long,
         value_name = "SIZE",

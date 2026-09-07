@@ -112,10 +112,13 @@ pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
 
     match (readings.swap_free_bytes, readings.swap_total_bytes) {
         (Some(free), Some(total)) => {
-            // macOS allocates swap lazily, so a swap total of zero is swap
-            // that was never needed, not swap that is exhausted; the floor is
-            // exempt then and the pressure signal guards that interval.
-            if total > 0 && free < policy.min_swap_free_bytes {
+            // macOS allocates swap lazily and grows it in 1 GiB files on
+            // demand, so a total of zero is swap that was never needed and a
+            // total at or below the floor is swap the system has barely
+            // touched; neither is exhaustion. The floor measures headroom
+            // only once swap has grown past it, and the pressure signal
+            // guards the interval before that.
+            if total > policy.min_swap_free_bytes && free < policy.min_swap_free_bytes {
                 refusing.push(format!(
                     "swap free {} is below the floor {}",
                     crate::format_bytes(free),
@@ -368,6 +371,30 @@ mod tests {
         };
         let verdict = decide(&readings, &Policy::default());
         assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
+    }
+
+    #[test]
+    fn exempts_a_swap_total_within_the_floor() {
+        // macOS grows swap in 1 GiB files: a 1 GiB total with 600 MiB free is
+        // a system that has swapped a few hundred MiB, not one that is out.
+        let readings = Readings {
+            swap_free_bytes: Some(600 << 20),
+            swap_total_bytes: Some(1 << 30),
+            ..healthy()
+        };
+        let verdict = decide(&readings, &Policy::default());
+        assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
+    }
+
+    #[test]
+    fn refuses_low_free_swap_once_swap_has_grown_past_the_floor() {
+        let readings = Readings {
+            swap_free_bytes: Some(600 << 20),
+            swap_total_bytes: Some(4 << 30),
+            ..healthy()
+        };
+        let verdict = decide(&readings, &Policy::default());
+        assert!(!verdict.admitted);
     }
 
     #[test]

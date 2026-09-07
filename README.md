@@ -131,9 +131,11 @@ one-minute load average per logical CPU is read on macOS and Linux and is
 unknown on Windows; it is reported but not enforced unless a ceiling is set.
 Available memory and its fraction of total are reported alongside.
 
-A swap total of zero is exempt from the swap floor: macOS allocates swap
-lazily, so zero total is swap that was never needed, not swap that is
-exhausted; the pressure signal guards that interval.
+A swap total at or below the floor is exempt from the swap floor: macOS
+allocates swap lazily and grows it in 1 GiB files on demand, so a total of
+zero is swap that was never needed and a total no larger than the floor is
+swap the system has barely touched. The floor measures headroom only once
+swap has grown past it; the pressure signal guards the interval before that.
 
 Every signal is optional. A platform that cannot answer, a failed sysctl, or
 an unparsable file yields an unknown for that signal only, and unknown is
