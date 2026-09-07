@@ -7,3 +7,4 @@ in a new record that supersedes the earlier one.
 | # | Decision | Adopted |
 | ---: | --- | --- |
 | [0001](0001-use-fixed-lower-child-priority.md) | Use a fixed lower priority for the child tree | 2026-08-23 |
+| [0002](0002-admission-reservations-live-in-the-supervisor.md) | Admission reservations live in the supervisor, not in the callers | 2026-09-07 |

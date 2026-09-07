@@ -112,6 +112,8 @@ Options:
   platform; Windows CPU limits are native.
 - `--quiet`, `-q` suppresses the interactive startup summary. Limit violations
   are still reported.
+- `--no-reservation` ignores outstanding admission reservations and does not
+  publish one for the command.
 
 ## Admission gate
 
@@ -159,10 +161,33 @@ but does not refuse, because whether "cannot tell" is a refusal is the
 caller's policy; `--refuse-unknown` treats an unknown enforced signal as a
 refusal for the caller that wants that.
 
-`with-limits --check-headroom` reads the signals, applies the policy, prints
-one line per signal, and exits `0` when admitted or `75` (`EX_TEMPFAIL`) when
-refused. `--json` prints the readings, the effective policy, the refusing
-reasons, and the unknown signals as one JSON object instead:
+An explicit absolute memory limit publishes an admission reservation for the
+life of the supervised command. For example, `--memory 8GiB` promises that the
+tree may grow to 8 GiB. Other admission checks subtract the unrealized part of
+that promise from free memory. The unrealized amount is the budget minus the
+tree's most recently sampled RSS, with a floor of zero. This avoids counting
+resident memory twice because the host's free-memory signal already reflects
+it. An observation older than 30 seconds contributes the full budget.
+
+The admission decision and reservation write share one exclusive file lock.
+Two callers that reach the gate together therefore make their decisions in
+sequence, and the second sees the first caller's promise. The lock is held only
+while reading, deciding, and writing. It is released before the command or a
+headroom wait begins.
+
+`auto` and percentage memory limits do not publish reservations. They cap a
+tree relative to whatever memory is free, rather than claiming a fixed amount.
+Reserving such a limit would let the first caller claim most of the host and
+serialize later work. Pass an absolute `--memory` size when admission
+coordination is required. `--check-headroom` reads reservations but never
+creates one.
+
+`with-limits --check-headroom` reads the signals and outstanding reservations,
+applies the policy, prints one line per signal plus the reservation count and
+unrealized byte total, and exits `0` when admitted or `75` (`EX_TEMPFAIL`) when
+refused. `--json` prints the readings, the effective policy, the reservation
+summary, the refusing reasons, and the unknown signals as one JSON object
+instead:
 
 ```sh
 with-limits --check-headroom
@@ -193,6 +218,8 @@ limit options the default `--memory auto` applies as usual.
 - `--max-load-per-cpu CORES` enforces a load ceiling. Without it, load is
   reported but never refuses.
 - `--refuse-unknown` treats an unknown enforced signal as a refusal.
+- `--no-reservation` bypasses the reservation store for this invocation. It
+  neither subtracts other reservations nor publishes its own.
 
 ## Agent hooks
 
@@ -235,6 +262,15 @@ leaving idle CPU capacity available to them.
 `WITH_LIMITS_MIN_SWAP_FREE`, and `WITH_LIMITS_MAX_LOAD_PER_CPU` set the
 admission-gate thresholds and accept the same values as their flags. The flags
 take precedence over the environment.
+
+`WITH_LIMITS_RESERVATION_DIR` selects the reservation store. Its default is
+`${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/with-limits-reservations`. The directory is
+created on demand with mode 0700, and each supervisor writes one JSON file named
+by its process id. Reservations coordinate only among processes that can see
+the same directory. macOS normally gives each user account a separate
+`TMPDIR`, so accounts on the same host need an explicitly configured shared
+directory to see one another's reservations. `with-limits` does not otherwise
+coordinate reservations across accounts.
 
 ## Enforcement
 

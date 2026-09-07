@@ -1,7 +1,7 @@
 use std::{
-    process::Command,
+    process::{Command, Stdio},
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 static RESOURCE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -51,6 +51,19 @@ fn memory_hog_helper() {
         }
         std::hint::black_box(&memory);
         std::thread::sleep(Duration::from_secs(10));
+    }
+}
+
+#[test]
+#[ignore]
+fn reservation_hold_helper() {
+    if let Some(marker) = std::env::var_os("WITH_LIMITS_TEST_MARKER") {
+        std::fs::write(marker, "running").unwrap();
+        let hold_millis = std::env::var("WITH_LIMITS_TEST_HOLD_MS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3_000);
+        std::thread::sleep(Duration::from_millis(hold_millis));
     }
 }
 
@@ -604,7 +617,7 @@ fn forwards_job_control_to_the_command_tree() {
 #[test]
 fn check_headroom_json_reports_every_signal_and_matches_the_exit_status() {
     let output = binary()
-        .args(["--check-headroom", "--json"])
+        .args(["--check-headroom", "--json", "--no-reservation"])
         .output()
         .unwrap();
     assert!(output.status.code().is_some());
@@ -616,6 +629,7 @@ fn check_headroom_json_reports_every_signal_and_matches_the_exit_status() {
         "swap_total_bytes",
         "load_per_cpu",
         "available_bytes",
+        "total_bytes",
         "available_fraction",
     ] {
         assert!(
@@ -636,11 +650,189 @@ fn check_headroom_json_reports_every_signal_and_matches_the_exit_status() {
     }
     assert!(report["refusing"].is_array());
     assert!(report["unknown"].is_array());
+    assert_eq!(report["reservations"]["count"], 0);
+    assert_eq!(report["reservations"]["unrealized_bytes"], 0);
     let admitted = report["admitted"]
         .as_bool()
         .expect("admitted is not a boolean");
     let expected = if admitted { 0 } else { 75 };
     assert_eq!(output.status.code(), Some(expected));
+}
+
+#[test]
+fn check_headroom_reports_reservations_and_the_escape_hatch_ignores_them() {
+    let store = temp_path("reported-reservations");
+    std::fs::create_dir(&store).unwrap();
+    let observed_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let record = serde_json::json!({
+        "pid": std::process::id(),
+        "budget_bytes": 4_096,
+        "observed_rss_bytes": 1_024,
+        "observed_at_unix_millis": observed_at,
+    });
+    std::fs::write(
+        store.join(std::process::id().to_string()),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let reported = binary()
+        .args(["--check-headroom", "--json"])
+        .env("WITH_LIMITS_RESERVATION_DIR", &store)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&reported.stdout).unwrap();
+    assert_eq!(report["reservations"]["count"], 1);
+    assert_eq!(report["reservations"]["unrealized_bytes"], 3_072);
+
+    let bypassed = binary()
+        .args(["--check-headroom", "--json", "--no-reservation"])
+        .env("WITH_LIMITS_RESERVATION_DIR", &store)
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bypassed.stdout).unwrap();
+    assert_eq!(report["reservations"]["count"], 0);
+    assert_eq!(report["reservations"]["unrealized_bytes"], 0);
+
+    let entries: Vec<_> = std::fs::read_dir(&store)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let numeric_files = entries
+        .iter()
+        .filter(|entry| entry.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .count();
+    assert_eq!(numeric_files, 1, "headroom checks must not reserve");
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn an_absolute_command_refreshes_and_releases_its_reservation() {
+    let _guard = resource_test_guard();
+    let store = temp_path("reservation-lifecycle-store");
+    let marker = temp_path("reservation-lifecycle-marker");
+    let mut child = binary()
+        .args(["--memory", "1GiB", "--poll-interval", "25ms", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "reservation_hold_helper"])
+        .env("WITH_LIMITS_RESERVATION_DIR", &store)
+        .env("WITH_LIMITS_TEST_MARKER", &marker)
+        .env("WITH_LIMITS_TEST_HOLD_MS", "2000")
+        .env("WITH_LIMITS_NICE", "off")
+        .spawn()
+        .unwrap();
+    let reservation_path = store.join(child.id().to_string());
+    assert!(wait_for_path(&marker, Duration::from_secs(2)));
+    assert!(wait_for_path(&reservation_path, Duration::from_secs(2)));
+
+    let observation_deadline = Instant::now() + Duration::from_secs(2);
+    let report = loop {
+        let output = binary()
+            .args(["--check-headroom", "--json"])
+            .env("WITH_LIMITS_RESERVATION_DIR", &store)
+            .output()
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if report["reservations"]["unrealized_bytes"].as_u64().unwrap() < (1_u64 << 30) {
+            break report;
+        }
+        assert!(
+            Instant::now() < observation_deadline,
+            "supervisor did not publish an RSS observation"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(report["reservations"]["count"], 1);
+    assert!(report["reservations"]["unrealized_bytes"].as_u64().unwrap() > 0);
+
+    assert!(child.wait().unwrap().success());
+    assert!(!reservation_path.exists());
+    let _ = std::fs::remove_file(marker);
+    let _ = std::fs::remove_dir_all(store);
+}
+
+#[test]
+fn concurrent_waiters_reserve_admission_for_only_one_command() {
+    let _guard = resource_test_guard();
+    let store = temp_path("admission-store");
+    let first_marker = temp_path("admission-first");
+    let second_marker = temp_path("admission-second");
+    let reading = binary()
+        .args([
+            "--check-headroom",
+            "--json",
+            "--no-reservation",
+            "--max-pressure",
+            "4",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value =
+        serde_json::from_slice(&reading.stdout).expect("parse baseline headroom report");
+    let total = report["readings"]["total_bytes"]
+        .as_u64()
+        .expect("host did not report total memory");
+    let free_percent = report["readings"]["memory_free_percent"]
+        .as_f64()
+        .expect("host did not report its free-memory signal");
+    let free_bytes = (free_percent / 100.0 * total as f64) as u64;
+    assert!(
+        free_bytes >= 256 << 20,
+        "acceptance test requires at least 256 MiB free"
+    );
+    let budget = free_bytes / 4 * 3;
+    let floor = free_percent / 2.0;
+
+    let contender = |marker: &std::path::Path| {
+        let mut command = binary();
+        command
+            .args([
+                "--wait-for-headroom=1s",
+                "--memory",
+                &budget.to_string(),
+                "--max-pressure",
+                "4",
+                "--min-memory-free-percent",
+                &floor.to_string(),
+                "--poll-interval",
+                "25ms",
+                "--",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "reservation_hold_helper"])
+            .env("WITH_LIMITS_RESERVATION_DIR", &store)
+            .env("WITH_LIMITS_TEST_MARKER", marker)
+            .env("WITH_LIMITS_NICE", "off")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+
+    let first = contender(&first_marker).spawn().unwrap();
+    let second = contender(&second_marker).spawn().unwrap();
+    let first_output = first.wait_with_output().unwrap();
+    let second_output = second.wait_with_output().unwrap();
+    let mut codes = [first_output.status.code(), second_output.status.code()];
+    codes.sort();
+    assert_eq!(codes, [Some(0), Some(75)]);
+    assert_ne!(first_marker.exists(), second_marker.exists());
+    let refused = if first_output.status.code() == Some(75) {
+        first_output
+    } else {
+        second_output
+    };
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("outstanding reservation(s)"),
+        "waiting message did not identify reservations: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    let _ = std::fs::remove_file(first_marker);
+    let _ = std::fs::remove_file(second_marker);
+    let _ = std::fs::remove_dir_all(store);
 }
 
 #[test]
@@ -765,7 +957,6 @@ fn resource_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(unix)]
 fn temp_path(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!(
         "with-limits-{label}-{}-{}",
@@ -774,7 +965,6 @@ fn temp_path(label: &str) -> std::path::PathBuf {
     ))
 }
 
-#[cfg(unix)]
 fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

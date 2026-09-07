@@ -1,9 +1,11 @@
 mod platform;
 mod process_tree;
+mod reservation;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use process_tree::ProcessTree;
+use reservation::{Reservation, ReservationStore};
 use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal},
@@ -14,7 +16,7 @@ use std::{
 use sysinfo::System;
 use with_limits::{
     format_bytes,
-    headroom::{self, Policy, Readings, Verdict},
+    headroom::{self, OutstandingReservations, Policy, Readings, Verdict},
     CpuLimit, HumanDuration, MemorySpec,
 };
 
@@ -142,6 +144,10 @@ struct Cli {
     #[arg(long)]
     refuse_unknown: bool,
 
+    /// Ignore outstanding reservations and do not publish one
+    #[arg(long)]
+    no_reservation: bool,
+
     #[arg(long, hide = true, default_value = "250ms")]
     poll_interval: HumanDuration,
 
@@ -187,19 +193,30 @@ fn run() -> Result<CommandResult> {
         bail!("specify a command after --, or use -c");
     }
 
-    let mut system = System::new_all();
-    system.refresh_memory();
-    if let Some(max_wait) = cli.wait_for_headroom {
-        if let Some(result) = wait_for_admission(&cli, &mut system, max_wait.map(|limit| limit.0))?
-        {
-            return Ok(result);
-        }
-    }
     let memory_spec = if cli.memory.is_none() && cli.cpu.is_none() && cli.time.is_none() {
         Some(MemorySpec::AvailableFraction(0.7))
     } else {
         cli.memory
     };
+    let reservation_budget = reservation_budget(memory_spec, cli.no_reservation);
+    let reservation_store = (!cli.no_reservation).then(ReservationStore::configured);
+    let mut system = System::new_all();
+    system.refresh_memory();
+    let mut reservation = None;
+    if let Some(max_wait) = cli.wait_for_headroom {
+        match wait_for_admission(
+            &cli,
+            &mut system,
+            max_wait.map(|limit| limit.0),
+            reservation_store.as_ref(),
+            reservation_budget,
+        )? {
+            WaitResult::Admitted(admitted_reservation) => reservation = admitted_reservation,
+            WaitResult::Expired => return Ok(CommandResult::Code(EXIT_HEADROOM_REFUSED)),
+        }
+    } else if let (Some(store), Some(budget)) = (reservation_store.as_ref(), reservation_budget) {
+        reservation = Some(store.reserve(budget)?);
+    }
     let available = if matches!(memory_spec, Some(MemorySpec::AvailableFraction(_))) {
         available_memory(&mut system)?
     } else {
@@ -207,7 +224,6 @@ fn run() -> Result<CommandResult> {
     };
     let memory_budget = resolve_memory_budget(memory_spec, available)?;
     let memory = memory_budget.process_limit;
-    let host_memory_reserve = memory_budget.host_reserve;
     let cpu = cli.cpu.map(|limit| limit.0);
     let nice_adjustment = configured_nice_adjustment()?;
     let mut command = build_command(&cli)?;
@@ -252,13 +268,23 @@ fn run() -> Result<CommandResult> {
 
     supervise(
         &cli,
-        memory,
-        host_memory_reserve,
+        memory_budget,
         cpu,
         child,
         controller,
         &mut system,
+        reservation,
     )
+}
+
+fn reservation_budget(spec: Option<MemorySpec>, disabled: bool) -> Option<u64> {
+    if disabled {
+        return None;
+    }
+    match spec {
+        Some(MemorySpec::Bytes(bytes)) => Some(bytes),
+        Some(MemorySpec::AvailableFraction(_)) | None => None,
+    }
 }
 
 fn resolve_memory_budget(spec: Option<MemorySpec>, available: u64) -> Result<MemoryBudget> {
@@ -297,11 +323,18 @@ fn check_headroom(cli: &Cli) -> Result<CommandResult> {
     let policy = admission_policy(cli);
     let mut system = System::new_all();
     let readings = Readings::collect(&mut system);
-    let verdict = headroom::decide(&readings, &policy);
-    if cli.json {
-        print_json_report(&readings, &policy, &verdict)?;
+    let (verdict, reservations) = if cli.no_reservation {
+        (
+            headroom::decide(&readings, &policy),
+            OutstandingReservations::default(),
+        )
     } else {
-        print_human_report(&readings, &policy, &verdict);
+        ReservationStore::configured().inspect(&readings, &policy)?
+    };
+    if cli.json {
+        print_json_report(&readings, &policy, reservations, &verdict)?;
+    } else {
+        print_human_report(&readings, &policy, reservations, &verdict);
     }
     Ok(CommandResult::Code(if verdict.admitted {
         0
@@ -314,15 +347,22 @@ fn check_headroom(cli: &Cli) -> Result<CommandResult> {
 struct HeadroomReport<'a> {
     readings: &'a Readings,
     policy: &'a Policy,
+    reservations: OutstandingReservations,
     refusing: &'a [String],
     unknown: &'a [&'static str],
     admitted: bool,
 }
 
-fn print_json_report(readings: &Readings, policy: &Policy, verdict: &Verdict) -> Result<()> {
+fn print_json_report(
+    readings: &Readings,
+    policy: &Policy,
+    reservations: OutstandingReservations,
+    verdict: &Verdict,
+) -> Result<()> {
     let report = HeadroomReport {
         readings,
         policy,
+        reservations,
         refusing: &verdict.refusing,
         unknown: &verdict.unknown,
         admitted: verdict.admitted,
@@ -332,7 +372,12 @@ fn print_json_report(readings: &Readings, policy: &Policy, verdict: &Verdict) ->
     Ok(())
 }
 
-fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
+fn print_human_report(
+    readings: &Readings,
+    policy: &Policy,
+    reservations: OutstandingReservations,
+    verdict: &Verdict,
+) {
     let unknown_outcome = |enforced: bool| {
         if policy.refuse_unknown && enforced {
             "refuses (unknown)"
@@ -353,16 +398,23 @@ fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
         ),
         None => println!("pressure level unknown: {}", unknown_outcome(true)),
     }
-    match readings.memory_free_percent {
+    let effective_memory_free =
+        headroom::memory_free_percent_after_reservations(readings, reservations);
+    let memory_label = if reservations.unrealized_bytes > 0 {
+        "free memory after reservations"
+    } else {
+        "free memory"
+    };
+    match effective_memory_free {
         Some(percent) => match policy.min_memory_free_percent {
             Some(floor) => println!(
-                "free memory {percent:.0}%, floor {floor:.0}%: {}",
+                "{memory_label} {percent:.0}%, floor {floor:.0}%: {}",
                 if percent < floor { "refuses" } else { "ok" }
             ),
-            None => println!("free memory {percent:.0}%: reported (no floor set)"),
+            None => println!("{memory_label} {percent:.0}%: reported (no floor set)"),
         },
         None => println!(
-            "free memory unknown: {}",
+            "{memory_label} unknown: {}",
             unknown_outcome(policy.min_memory_free_percent.is_some())
         ),
     }
@@ -413,6 +465,11 @@ fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
         ),
         _ => println!("available memory unknown: reported"),
     }
+    println!(
+        "outstanding reservations {} across {} process(es): applied to free memory",
+        format_bytes(reservations.unrealized_bytes),
+        reservations.count
+    );
     if verdict.admitted {
         println!("admitted");
     } else {
@@ -424,18 +481,31 @@ fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
 /// run the command. No signal handler is installed during the wait, so a
 /// terminating signal ends the process with the default disposition, as it
 /// does for any interrupted wrapper.
+enum WaitResult {
+    Admitted(Option<Reservation>),
+    Expired,
+}
+
 fn wait_for_admission(
     cli: &Cli,
     system: &mut System,
     max_wait: Option<Duration>,
-) -> Result<Option<CommandResult>> {
+    reservation_store: Option<&ReservationStore>,
+    reservation_budget: Option<u64>,
+) -> Result<WaitResult> {
     let policy = admission_policy(cli);
     let started = Instant::now();
     let mut attempt = 0_u32;
     let mut last_notice: Option<Instant> = None;
     loop {
         let readings = Readings::collect(system);
-        let verdict = headroom::decide(&readings, &policy);
+        let admission = reservation_store
+            .map(|store| store.decide_and_reserve(&readings, &policy, reservation_budget))
+            .transpose()?;
+        let (verdict, reservation) = match admission {
+            Some(admission) => (admission.verdict, admission.reservation),
+            None => (headroom::decide(&readings, &policy), None),
+        };
         if verdict.admitted {
             if last_notice.is_some() && !cli.quiet {
                 eprintln!(
@@ -443,7 +513,7 @@ fn wait_for_admission(
                     started.elapsed().as_secs_f64()
                 );
             }
-            return Ok(None);
+            return Ok(WaitResult::Admitted(reservation));
         }
         let elapsed = started.elapsed();
         if let Some(limit) = max_wait {
@@ -453,7 +523,7 @@ fn wait_for_admission(
                     HumanDuration(limit),
                     verdict.refusing.join("; ")
                 );
-                return Ok(Some(CommandResult::Code(EXIT_HEADROOM_REFUSED)));
+                return Ok(WaitResult::Expired);
             }
         }
         if !cli.quiet && last_notice.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
@@ -773,13 +843,15 @@ fn print_summary(
 
 fn supervise(
     cli: &Cli,
-    memory: Option<u64>,
-    host_memory_reserve: Option<u64>,
+    memory_budget: MemoryBudget,
     cpu: Option<f64>,
     mut child: Child,
     mut controller: platform::Controller,
     system: &mut System,
+    mut reservation: Option<Reservation>,
 ) -> Result<CommandResult> {
+    let memory = memory_budget.process_limit;
+    let host_memory_reserve = memory_budget.host_reserve;
     let started = Instant::now();
     let deadline = cli
         .time
@@ -813,7 +885,7 @@ fn supervise(
                 root_exited = true;
             }
         }
-        let usage = tree.refresh(system);
+        let usage = refresh_tree(&mut tree, system, &mut reservation)?;
         if root_exited {
             tree.retire_root();
         }
@@ -838,7 +910,7 @@ fn supervise(
 
         #[cfg(unix)]
         if external_termination.is_some_and(|termination| Instant::now() >= termination.deadline) {
-            force_command(&mut child, &controller, &mut tree, system)?;
+            force_command(&mut child, &controller, &mut tree, system, &mut reservation)?;
             controller.disarm();
             let status = child
                 .wait()
@@ -869,7 +941,14 @@ fn supervise(
                     format_bytes(usage.rss_bytes),
                     format_bytes(limit)
                 );
-                stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0)?;
+                stop_command(
+                    &mut child,
+                    &controller,
+                    &mut tree,
+                    system,
+                    &mut reservation,
+                    cli.kill_after.0,
+                )?;
                 controller.disarm();
                 return Ok(CommandResult::Code(EXIT_MEMORY));
             }
@@ -887,7 +966,14 @@ fn supervise(
                         format_bytes(available),
                         format_bytes(reserve)
                     );
-                    stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0)?;
+                    stop_command(
+                        &mut child,
+                        &controller,
+                        &mut tree,
+                        system,
+                        &mut reservation,
+                        cli.kill_after.0,
+                    )?;
                     controller.disarm();
                     return Ok(CommandResult::Code(EXIT_MEMORY));
                 }
@@ -896,7 +982,14 @@ fn supervise(
 
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             eprintln!("with-limits: time limit exceeded");
-            stop_command(&mut child, &controller, &mut tree, system, cli.kill_after.0)?;
+            stop_command(
+                &mut child,
+                &controller,
+                &mut tree,
+                system,
+                &mut reservation,
+                cli.kill_after.0,
+            )?;
             controller.disarm();
             return Ok(CommandResult::Code(EXIT_TIMEOUT));
         }
@@ -912,7 +1005,7 @@ fn supervise(
                         sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(10),
                         deadline,
                     );
-                    tree.refresh(system);
+                    refresh_tree(&mut tree, system, &mut reservation)?;
                     let targets = tree.identities();
                     controller.set_targets(&targets)?;
                     controller.resume(&targets)?;
@@ -1027,14 +1120,27 @@ fn sleep_until_or_deadline(duration: Duration, deadline: Option<Instant>) -> Dur
     started.elapsed().min(duration)
 }
 
+fn refresh_tree(
+    tree: &mut ProcessTree,
+    system: &mut System,
+    reservation: &mut Option<Reservation>,
+) -> Result<process_tree::Usage> {
+    let usage = tree.refresh(system);
+    if let Some(reservation) = reservation {
+        reservation.update(usage.rss_bytes)?;
+    }
+    Ok(usage)
+}
+
 fn stop_command(
     child: &mut Child,
     controller: &platform::Controller,
     tree: &mut ProcessTree,
     system: &mut System,
+    reservation: &mut Option<Reservation>,
     grace: Duration,
 ) -> Result<()> {
-    tree.refresh(system);
+    refresh_tree(tree, system, reservation)?;
     let mut targets = tree.identities();
     controller.set_targets(&targets)?;
     controller.terminate(&targets)?;
@@ -1045,7 +1151,7 @@ fn stop_command(
         child
             .try_wait()
             .context("could not inspect command during termination")?;
-        tree.refresh(system);
+        refresh_tree(tree, system, reservation)?;
         targets = tree.identities();
         controller.set_targets(&targets)?;
         if tree.is_empty() {
@@ -1053,7 +1159,7 @@ fn stop_command(
         }
         thread::sleep(Duration::from_millis(25).min(grace));
     }
-    force_command(child, controller, tree, system)
+    force_command(child, controller, tree, system, reservation)
 }
 
 fn force_command(
@@ -1061,6 +1167,7 @@ fn force_command(
     controller: &platform::Controller,
     tree: &mut ProcessTree,
     system: &mut System,
+    reservation: &mut Option<Reservation>,
 ) -> Result<()> {
     let mut targets = tree.identities();
     controller.set_targets(&targets)?;
@@ -1070,7 +1177,7 @@ fn force_command(
         child
             .try_wait()
             .context("could not inspect command after forced termination")?;
-        tree.refresh(system);
+        refresh_tree(tree, system, reservation)?;
         targets = tree.identities();
         controller.set_targets(&targets)?;
         if tree.is_empty() {
@@ -1235,6 +1342,23 @@ mod tests {
                 process_limit: None,
                 host_reserve: None,
             }
+        );
+    }
+
+    #[test]
+    fn only_absolute_memory_limits_publish_reservations() {
+        assert_eq!(
+            reservation_budget(Some(MemorySpec::Bytes(4_096)), false),
+            Some(4_096)
+        );
+        assert_eq!(
+            reservation_budget(Some(MemorySpec::AvailableFraction(0.7)), false),
+            None
+        );
+        assert_eq!(reservation_budget(None, false), None);
+        assert_eq!(
+            reservation_budget(Some(MemorySpec::Bytes(4_096)), true),
+            None
         );
     }
 

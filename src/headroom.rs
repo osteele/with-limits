@@ -24,6 +24,7 @@ pub struct Readings {
     /// Unknown on Windows.
     pub load_per_cpu: Option<f64>,
     pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
     /// Available memory as a fraction of total memory.
     pub available_fraction: Option<f64>,
     /// Free memory as a percentage of total. On macOS this is the kernel's own
@@ -49,6 +50,7 @@ impl Readings {
             swap_total_bytes: Some(system.total_swap()),
             load_per_cpu: load_per_cpu(system),
             available_bytes: (available > 0).then_some(available),
+            total_bytes: (total > 0).then_some(total),
             available_fraction: (available > 0 && total > 0)
                 .then(|| available as f64 / total as f64),
             memory_free_percent: memory_free_percent(available, total),
@@ -103,10 +105,27 @@ pub struct Verdict {
     pub unknown: Vec<&'static str>,
 }
 
+/// Reservations that reduce the memory available for admission.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct OutstandingReservations {
+    pub count: usize,
+    pub unrealized_bytes: u64,
+}
+
 /// Apply `policy` to `readings`. A signal the platform could not read is
 /// named in `unknown`; it refuses only when the policy asks for that and the
 /// signal is enforced.
 pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
+    decide_with_reservations(readings, policy, OutstandingReservations::default())
+}
+
+/// Apply `policy` after subtracting the unrealized part of live memory
+/// reservations from the host's free-memory signal.
+pub fn decide_with_reservations(
+    readings: &Readings,
+    policy: &Policy,
+    reservations: OutstandingReservations,
+) -> Verdict {
     let mut refusing = Vec::new();
     let mut unknown = Vec::new();
 
@@ -128,13 +147,27 @@ pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
         }
     }
 
-    match readings.memory_free_percent {
+    let adjusted_memory_free_percent =
+        memory_free_percent_after_reservations(readings, reservations);
+    match adjusted_memory_free_percent {
         Some(percent) => {
             if let Some(floor) = policy.min_memory_free_percent {
                 if percent < floor {
-                    refusing.push(format!(
-                        "free memory {percent:.0}% is below the floor {floor:.0}%"
-                    ));
+                    if reservations.unrealized_bytes > 0
+                        && readings
+                            .memory_free_percent
+                            .is_some_and(|unadjusted| unadjusted >= floor)
+                    {
+                        refusing.push(format!(
+                            "{} in {} outstanding reservation(s) reduce free memory to {percent:.0}%, below the floor {floor:.0}%",
+                            crate::format_bytes(reservations.unrealized_bytes),
+                            reservations.count
+                        ));
+                    } else {
+                        refusing.push(format!(
+                            "free memory {percent:.0}% is below the floor {floor:.0}%"
+                        ));
+                    }
                 }
             }
         }
@@ -202,6 +235,20 @@ pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
         refusing,
         unknown,
     }
+}
+
+/// Return the free-memory signal after subtracting unrealized reservations.
+pub fn memory_free_percent_after_reservations(
+    readings: &Readings,
+    reservations: OutstandingReservations,
+) -> Option<f64> {
+    let percent = readings.memory_free_percent?;
+    if reservations.unrealized_bytes == 0 {
+        return Some(percent);
+    }
+    let total = readings.total_bytes?;
+    let free_bytes = (percent / 100.0 * total as f64) as u64;
+    Some(free_bytes.saturating_sub(reservations.unrealized_bytes) as f64 / total as f64 * 100.0)
 }
 
 /// Name a macOS pressure level for display.
@@ -374,6 +421,7 @@ mod tests {
             swap_total_bytes: Some(8 << 30),
             load_per_cpu: Some(0.5),
             available_bytes: Some(12 << 30),
+            total_bytes: Some(16 << 30),
             available_fraction: Some(0.75),
             memory_free_percent: Some(75.0),
         }
@@ -446,6 +494,7 @@ mod tests {
             swap_total_bytes: Some(22528 << 20),
             load_per_cpu: Some(2.7),
             available_bytes: Some(32 << 20),
+            total_bytes: Some(16 << 30),
             available_fraction: Some(0.002),
         };
         assert!(!decide(&readings, &Policy::default()).admitted);
@@ -462,6 +511,90 @@ mod tests {
             ..Policy::default()
         };
         assert!(decide(&readings, &policy).admitted);
+    }
+
+    #[test]
+    fn subtracts_unrealized_reservations_from_free_memory() {
+        let readings = Readings {
+            memory_free_percent: Some(50.0),
+            total_bytes: Some(10_000),
+            ..healthy()
+        };
+        let policy = Policy {
+            min_memory_free_percent: Some(30.0),
+            ..Policy::default()
+        };
+
+        let at_floor = decide_with_reservations(
+            &readings,
+            &policy,
+            OutstandingReservations {
+                count: 2,
+                unrealized_bytes: 2_000,
+            },
+        );
+        assert!(at_floor.admitted, "the memory floor is inclusive");
+
+        let below_floor = decide_with_reservations(
+            &readings,
+            &policy,
+            OutstandingReservations {
+                count: 2,
+                unrealized_bytes: 2_001,
+            },
+        );
+        assert!(!below_floor.admitted);
+        assert_eq!(below_floor.refusing.len(), 1);
+        assert!(below_floor.refusing[0].contains("outstanding reservation(s)"));
+        assert!(below_floor.refusing[0].contains("2.0 KiB"));
+    }
+
+    #[test]
+    fn reservation_subtraction_saturates_at_zero_free_memory() {
+        let readings = Readings {
+            memory_free_percent: Some(20.0),
+            total_bytes: Some(10_000),
+            ..healthy()
+        };
+        let policy = Policy {
+            min_memory_free_percent: Some(1.0),
+            ..Policy::default()
+        };
+
+        let verdict = decide_with_reservations(
+            &readings,
+            &policy,
+            OutstandingReservations {
+                count: 1,
+                unrealized_bytes: 3_000,
+            },
+        );
+        assert!(!verdict.admitted);
+        assert!(verdict.refusing[0].contains("free memory to 0%"));
+    }
+
+    #[test]
+    fn reservation_adjustment_is_unknown_without_total_memory() {
+        let readings = Readings {
+            total_bytes: None,
+            ..healthy()
+        };
+        let policy = Policy {
+            refuse_unknown: true,
+            ..Policy::default()
+        };
+
+        let verdict = decide_with_reservations(
+            &readings,
+            &policy,
+            OutstandingReservations {
+                count: 1,
+                unrealized_bytes: 1,
+            },
+        );
+        assert!(!verdict.admitted);
+        assert_eq!(verdict.unknown, ["free memory"]);
+        assert_eq!(verdict.refusing, ["free memory is unknown"]);
     }
 
     #[test]

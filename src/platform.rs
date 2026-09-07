@@ -235,6 +235,21 @@ mod imp {
         }
         Err(error).with_context(|| format!("could not signal process target {pid}"))
     }
+
+    /// `Some(false)` is returned only when the kernel reports that the PID
+    /// does not exist. Permission errors prove that a process occupies it.
+    pub fn process_is_alive(pid: u32) -> Result<Option<bool>> {
+        let pid = i32::try_from(pid).context("reservation PID is too large")?;
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            return Ok(Some(true));
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(Some(false)),
+            Some(libc::EPERM) => Ok(Some(true)),
+            _ => Err(error).with_context(|| format!("could not inspect reservation PID {pid}")),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -248,7 +263,9 @@ mod imp {
         time::{SystemTime, UNIX_EPOCH},
     };
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE,
+        },
         System::{
             JobObjects::{
                 AssignProcessToJobObject, CreateJobObjectW, JobObjectCpuRateControlInformation,
@@ -258,7 +275,8 @@ mod imp {
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
             },
             Threading::{
-                CreateEventW, GetActiveProcessorCount, SetEvent, BELOW_NORMAL_PRIORITY_CLASS,
+                CreateEventW, GetActiveProcessorCount, GetExitCodeProcess, OpenProcess, SetEvent,
+                BELOW_NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
     };
@@ -433,6 +451,27 @@ mod imp {
         }
         Ok(())
     }
+
+    /// Access-denied leaves liveness unknown; callers keep the reservation in
+    /// that case so an unreadable process is never mistaken for a dead one.
+    pub fn process_is_alive(pid: u32) -> Result<Option<bool>> {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error().map(|code| code as u32) {
+                Some(ERROR_INVALID_PARAMETER) => Ok(Some(false)),
+                Some(ERROR_ACCESS_DENIED) => Ok(None),
+                _ => Err(error).with_context(|| format!("could not inspect reservation PID {pid}")),
+            };
+        }
+        let mut exit_code = 0;
+        let result = unsafe { GetExitCodeProcess(process, &mut exit_code) };
+        unsafe { CloseHandle(process) };
+        if result == 0 {
+            return Ok(None);
+        }
+        Ok(Some(exit_code == STILL_ACTIVE as u32))
+    }
 }
 
-pub use imp::Controller;
+pub use imp::{process_is_alive, Controller};
