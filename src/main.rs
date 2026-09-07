@@ -101,17 +101,29 @@ struct Cli {
         long,
         value_name = "N",
         env = "WITH_LIMITS_MAX_PRESSURE",
-        default_value = "1"
+        default_value = "2"
     )]
     max_pressure: i32,
 
-    /// Lowest admitted free swap once swap has grown past this size. A swap
-    /// total at or below it is swap the system has barely touched and is exempt
+    /// Lowest admitted free memory, as a percentage of total. This is the
+    /// signal that separates ordinary memory management from exhaustion
+    #[arg(
+        long,
+        value_name = "PERCENT",
+        env = "WITH_LIMITS_MIN_MEMORY_FREE_PERCENT",
+        default_value = "10",
+        value_parser = parse_free_percent
+    )]
+    min_memory_free_percent: f64,
+
+    /// Lowest admitted free swap once swap has grown past this size. Zero,
+    /// the default, reports swap without enforcing it: macOS sizes swap on
+    /// demand, so free space within the current files is not exhaustion
     #[arg(
         long,
         value_name = "SIZE",
         env = "WITH_LIMITS_MIN_SWAP_FREE",
-        default_value = "1GiB",
+        default_value = "0",
         value_parser = parse_swap_floor
     )]
     min_swap_free: u64,
@@ -273,6 +285,8 @@ fn host_reserve_crossed(reserve: u64, available: u64) -> bool {
 fn admission_policy(cli: &Cli) -> Policy {
     Policy {
         max_pressure: cli.max_pressure,
+        min_memory_free_percent: (cli.min_memory_free_percent > 0.0)
+            .then_some(cli.min_memory_free_percent),
         min_swap_free_bytes: cli.min_swap_free,
         max_load_per_cpu: cli.max_load_per_cpu,
         refuse_unknown: cli.refuse_unknown,
@@ -339,10 +353,30 @@ fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
         ),
         None => println!("pressure level unknown: {}", unknown_outcome(true)),
     }
+    match readings.memory_free_percent {
+        Some(percent) => match policy.min_memory_free_percent {
+            Some(floor) => println!(
+                "free memory {percent:.0}%, floor {floor:.0}%: {}",
+                if percent < floor { "refuses" } else { "ok" }
+            ),
+            None => println!("free memory {percent:.0}%: reported (no floor set)"),
+        },
+        None => println!(
+            "free memory unknown: {}",
+            unknown_outcome(policy.min_memory_free_percent.is_some())
+        ),
+    }
     match (readings.swap_free_bytes, readings.swap_total_bytes) {
-        (Some(free), Some(0)) => println!(
-            "swap free {}, no swap allocated: ok (the floor is exempt)",
-            format_bytes(free)
+        (Some(free), Some(total)) if policy.min_swap_free_bytes == 0 => println!(
+            "swap free {} of {} total: reported (no floor set)",
+            format_bytes(free),
+            format_bytes(total)
+        ),
+        (Some(free), Some(total)) if total <= policy.min_swap_free_bytes => println!(
+            "swap free {} of {} total, floor {}: ok (swap has not grown past the floor)",
+            format_bytes(free),
+            format_bytes(total),
+            format_bytes(policy.min_swap_free_bytes)
         ),
         (Some(free), Some(total)) => println!(
             "swap free {} of {} total, floor {}: {}",
@@ -355,7 +389,10 @@ fn print_human_report(readings: &Readings, policy: &Policy, verdict: &Verdict) {
                 "ok"
             }
         ),
-        _ => println!("swap free unknown: {}", unknown_outcome(true)),
+        _ => println!(
+            "swap free unknown: {}",
+            unknown_outcome(policy.min_swap_free_bytes > 0)
+        ),
     }
     match (readings.load_per_cpu, policy.max_load_per_cpu) {
         (Some(load), Some(ceiling)) => println!(
@@ -448,6 +485,16 @@ fn parse_swap_floor(value: &str) -> Result<u64, String> {
             Err("the swap floor takes an absolute size, not a percentage or auto".into())
         }
     }
+}
+
+fn parse_free_percent(value: &str) -> Result<f64, String> {
+    let percent: f64 = value
+        .parse()
+        .map_err(|_| format!("not a percentage: {value}"))?;
+    if !(0.0..=100.0).contains(&percent) {
+        return Err(format!("percentage must be between 0 and 100: {value}"));
+    }
+    Ok(percent)
 }
 
 fn parse_load_ceiling(value: &str) -> Result<f64, String> {

@@ -122,20 +122,35 @@ resource that exhausts first on a machine running many agents is RAM, so the
 gate is built on memory signals: CPU load is the symptom of paging, and a load
 threshold fires late and on the wrong quantity.
 
-Three signals feed the decision. The kernel memory pressure level (1 normal,
-2 warn, 4 critical) is read on macOS from `kern.memorystatus_vm_pressure_level`
-and on Linux derived from the PSI `/proc/pressure/memory` stall time — a
-mapping onto the macOS scale chosen for this tool, not a kernel verdict; it is
-unknown on Windows. Swap free and swap total are read on every platform. The
-one-minute load average per logical CPU is read on macOS and Linux and is
-unknown on Windows; it is reported but not enforced unless a ceiling is set.
-Available memory and its fraction of total are reported alongside.
+Four signals feed the decision, and two of them are enforced by default.
 
-A swap total at or below the floor is exempt from the swap floor: macOS
-allocates swap lazily and grows it in 1 GiB files on demand, so a total of
-zero is swap that was never needed and a total no larger than the floor is
-swap the system has barely touched. The floor measures headroom only once
-swap has grown past it; the pressure signal guards the interval before that.
+The kernel memory pressure level (1 normal, 2 warn, 4 critical) is read on
+macOS from `kern.memorystatus_vm_pressure_level` and on Linux derived from the
+PSI `/proc/pressure/memory` stall time — a mapping onto the macOS scale chosen
+for this tool, not a kernel verdict; it is unknown on Windows. The default
+refuses only `critical`. Warn is the ordinary operating state of a machine
+running many concurrent tasks: measured on one such workstation it persisted
+for hours at a stretch while a third of memory stayed free, so refusing warn
+parks work indefinitely without reducing risk.
+
+Free memory as a percentage of total is the signal that separates ordinary
+memory management from exhaustion, and the default floor is 10%. On macOS it
+is the kernel's own `kern.memorystatus_level`; elsewhere it is derived from
+available and total memory. On the workstation above, every state the gate
+refused sat between 27% and 53% free, while the state it exists to refuse had
+32 MB free, effectively zero.
+
+Swap free and swap total are read on every platform and are **reported, not
+enforced**, by default. Free space inside the current swap files does not
+measure exhaustion on macOS: swap is sized on demand and grows while free disk
+allows, so the fraction in use rises simply because the kernel sized swap to
+the workload. Setting `--min-swap-free` enforces a floor for a platform where
+swap is a fixed partition; a swap total at or below that floor is then exempt,
+since swap that small has barely been touched.
+
+The one-minute load average per logical CPU is read on macOS and Linux and is
+unknown on Windows; it is reported but not enforced unless a ceiling is set.
+CPU load is the late symptom of paging, not the resource that runs out.
 
 Every signal is optional. A platform that cannot answer, a failed sysctl, or
 an unparsable file yields an unknown for that signal only, and unknown is
@@ -169,9 +184,12 @@ The wait never implies a limit and a limit never implies a wait; with no
 limit options the default `--memory auto` applies as usual.
 
 - `--max-pressure N` sets the highest admitted pressure level. The default is
-  `1`, so only normal pressure admits.
+  `2`, so only critical pressure refuses.
+- `--min-memory-free-percent PERCENT` sets the free-memory floor. The default
+  is `10`; `0` reports free memory without enforcing it.
 - `--min-swap-free SIZE` sets the swap floor as an absolute size (percentages
-  are not accepted). The default is `1GiB`; `0` disables the floor.
+  are not accepted). The default is `0`, which reports swap without enforcing
+  it.
 - `--max-load-per-cpu CORES` enforces a load ceiling. Without it, load is
   reported but never refuses.
 - `--refuse-unknown` treats an unknown enforced signal as a refusal.
@@ -213,10 +231,10 @@ The priority does not change in response to load or the number of running
 agents. Fixed lower priority lets foreground work preempt background jobs while
 leaving idle CPU capacity available to them.
 
-`WITH_LIMITS_MAX_PRESSURE`, `WITH_LIMITS_MIN_SWAP_FREE`, and
-`WITH_LIMITS_MAX_LOAD_PER_CPU` set the admission-gate thresholds and accept
-the same values as `--max-pressure`, `--min-swap-free`, and
-`--max-load-per-cpu`. The flags take precedence over the environment.
+`WITH_LIMITS_MAX_PRESSURE`, `WITH_LIMITS_MIN_MEMORY_FREE_PERCENT`,
+`WITH_LIMITS_MIN_SWAP_FREE`, and `WITH_LIMITS_MAX_LOAD_PER_CPU` set the
+admission-gate thresholds and accept the same values as their flags. The flags
+take precedence over the environment.
 
 ## Enforcement
 

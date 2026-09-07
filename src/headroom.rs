@@ -26,6 +26,13 @@ pub struct Readings {
     pub available_bytes: Option<u64>,
     /// Available memory as a fraction of total memory.
     pub available_fraction: Option<f64>,
+    /// Free memory as a percentage of total. On macOS this is the kernel's own
+    /// `kern.memorystatus_level`; elsewhere it is derived from available
+    /// memory. It is the signal that separates a host doing ordinary memory
+    /// management from one about to run out: a workstation running many agent
+    /// sessions sits at warn pressure for hours with a third of memory free,
+    /// while the state this gate exists to refuse had 32 MB free.
+    pub memory_free_percent: Option<f64>,
 }
 
 impl Readings {
@@ -44,6 +51,7 @@ impl Readings {
             available_bytes: (available > 0).then_some(available),
             available_fraction: (available > 0 && total > 0)
                 .then(|| available as f64 / total as f64),
+            memory_free_percent: memory_free_percent(available, total),
         }
     }
 }
@@ -51,24 +59,34 @@ impl Readings {
 /// The thresholds a host must satisfy to admit new work.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Policy {
-    /// Refuse when the pressure level exceeds this. Levels are 1, 2, and 4,
-    /// so the default of 1 admits only a host at normal pressure.
+    /// Refuse when the pressure level exceeds this. Levels are 1, 2, and 4.
+    /// The default of 2 refuses only a host the kernel calls critical: warn is
+    /// the ordinary operating state of a machine running many concurrent
+    /// tasks, so refusing it blocks work for hours without reducing risk.
     pub max_pressure: i32,
-    /// Refuse when swap free falls below this floor and swap exists at all.
+    /// Refuse when free memory falls below this percentage of total. `None`
+    /// reports the percentage without enforcing it.
+    pub min_memory_free_percent: Option<f64>,
+    /// Refuse when swap free falls below this floor, once swap has grown past
+    /// it. Zero, the default, reports swap without enforcing it: macOS sizes
+    /// swap on demand and grows it while free disk allows, so free space
+    /// within the current swap files does not measure exhaustion.
     pub min_swap_free_bytes: u64,
     /// Refuse when load per CPU exceeds this ceiling. `None` reports load
     /// without enforcing it.
     pub max_load_per_cpu: Option<f64>,
-    /// Treat an unknown enforced signal as a refusal. Enforced signals are
-    /// pressure and swap always, and load when a ceiling is set.
+    /// Treat an unknown enforced signal as a refusal. A signal is enforced
+    /// when its threshold is set: pressure always, free memory and swap and
+    /// load when their floors or ceiling are.
     pub refuse_unknown: bool,
 }
 
 impl Default for Policy {
     fn default() -> Self {
         Self {
-            max_pressure: 1,
-            min_swap_free_bytes: 1 << 30,
+            max_pressure: 2,
+            min_memory_free_percent: Some(10.0),
+            min_swap_free_bytes: 0,
             max_load_per_cpu: None,
             refuse_unknown: false,
         }
@@ -110,6 +128,24 @@ pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
         }
     }
 
+    match readings.memory_free_percent {
+        Some(percent) => {
+            if let Some(floor) = policy.min_memory_free_percent {
+                if percent < floor {
+                    refusing.push(format!(
+                        "free memory {percent:.0}% is below the floor {floor:.0}%"
+                    ));
+                }
+            }
+        }
+        None => {
+            unknown.push("free memory");
+            if policy.refuse_unknown && policy.min_memory_free_percent.is_some() {
+                refusing.push("free memory is unknown".into());
+            }
+        }
+    }
+
     match (readings.swap_free_bytes, readings.swap_total_bytes) {
         (Some(free), Some(total)) => {
             // macOS allocates swap lazily and grows it in 1 GiB files on
@@ -128,7 +164,12 @@ pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
         }
         _ => {
             unknown.push("swap");
-            if policy.refuse_unknown {
+            // Gated on the floor for the same reason free memory and load are:
+            // refuse-on-unknown applies to a signal this policy enforces, and
+            // a floor of zero says swap is reported rather than enforced.
+            // Refusing here would reject a host over a signal the same run
+            // reports as advisory.
+            if policy.refuse_unknown && policy.min_swap_free_bytes > 0 {
                 refusing.push("swap headroom is unknown".into());
             }
         }
@@ -152,7 +193,7 @@ pub fn decide(readings: &Readings, policy: &Policy) -> Verdict {
         }
     }
 
-    if readings.available_bytes.is_none() {
+    if readings.available_bytes.is_none() && readings.memory_free_percent.is_none() {
         unknown.push("available memory");
     }
 
@@ -188,6 +229,34 @@ fn kernel_pressure_level() -> Option<i32> {
         )
     };
     (result == 0).then_some(level)
+}
+
+/// Free memory as a percentage of total.
+///
+/// macOS reports it directly as `kern.memorystatus_level`, which is the
+/// counter the kernel's own pressure logic watches. Elsewhere it is derived
+/// from the available and total figures sysinfo provides, and is unknown when
+/// either is zero.
+#[cfg(target_os = "macos")]
+fn memory_free_percent(_available: u64, _total: u64) -> Option<f64> {
+    let name = b"kern.memorystatus_level\0";
+    let mut level: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&level);
+    let result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr().cast(),
+            &mut level as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0).then_some(f64::from(level))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memory_free_percent(available: u64, total: u64) -> Option<f64> {
+    (available > 0 && total > 0).then(|| available as f64 / total as f64 * 100.0)
 }
 
 /// Map the PSI memory `some avg10` stall percentage onto the macOS pressure
@@ -289,6 +358,15 @@ pub fn jitter_sample() -> f64 {
 mod tests {
     use super::*;
 
+    /// A policy that enforces the swap floor, for the tests whose subject is
+    /// the floor itself. The default policy reports swap without enforcing it.
+    fn swap_enforced() -> Policy {
+        Policy {
+            min_swap_free_bytes: 1 << 30,
+            ..Policy::default()
+        }
+    }
+
     fn healthy() -> Readings {
         Readings {
             pressure_level: Some(1),
@@ -297,6 +375,7 @@ mod tests {
             load_per_cpu: Some(0.5),
             available_bytes: Some(12 << 30),
             available_fraction: Some(0.75),
+            memory_free_percent: Some(75.0),
         }
     }
 
@@ -311,13 +390,78 @@ mod tests {
     #[test]
     fn refuses_on_pressure_alone() {
         let readings = Readings {
-            pressure_level: Some(2),
+            pressure_level: Some(4),
             ..healthy()
         };
         let verdict = decide(&readings, &Policy::default());
         assert!(!verdict.admitted);
         assert_eq!(verdict.refusing.len(), 1);
-        assert!(verdict.refusing[0].contains("pressure level 2 (warn)"));
+        assert!(verdict.refusing[0].contains("pressure level 4 (critical)"));
+    }
+
+    #[test]
+    fn admits_warn_pressure() {
+        // Warn is the ordinary state of a machine running many agent sessions;
+        // refusing it parks work for hours without reducing risk.
+        let readings = Readings {
+            pressure_level: Some(2),
+            ..healthy()
+        };
+        assert!(decide(&readings, &Policy::default()).admitted);
+    }
+
+    #[test]
+    fn refuses_on_free_memory_alone() {
+        let readings = Readings {
+            memory_free_percent: Some(3.0),
+            ..healthy()
+        };
+        let verdict = decide(&readings, &Policy::default());
+        assert!(!verdict.admitted);
+        assert_eq!(verdict.refusing.len(), 1);
+        assert!(verdict.refusing[0].contains("free memory 3%"));
+    }
+
+    #[test]
+    fn admits_the_free_memory_a_busy_workstation_reports() {
+        // Every refusal observed on this machine sat between 27% and 53%.
+        let readings = Readings {
+            pressure_level: Some(2),
+            memory_free_percent: Some(34.0),
+            swap_free_bytes: Some(376 << 20),
+            swap_total_bytes: Some(2 << 30),
+            ..healthy()
+        };
+        let verdict = decide(&readings, &Policy::default());
+        assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
+    }
+
+    #[test]
+    fn refuses_the_state_the_gate_was_built_for() {
+        // 2026-09-05: 32 MB free of memory, swap 21205 MB used of 22528.
+        let readings = Readings {
+            pressure_level: Some(4),
+            memory_free_percent: Some(0.2),
+            swap_free_bytes: Some(1323 << 20),
+            swap_total_bytes: Some(22528 << 20),
+            load_per_cpu: Some(2.7),
+            available_bytes: Some(32 << 20),
+            available_fraction: Some(0.002),
+        };
+        assert!(!decide(&readings, &Policy::default()).admitted);
+    }
+
+    #[test]
+    fn reports_free_memory_without_enforcing_it_when_no_floor_is_set() {
+        let readings = Readings {
+            memory_free_percent: Some(1.0),
+            ..healthy()
+        };
+        let policy = Policy {
+            min_memory_free_percent: None,
+            ..Policy::default()
+        };
+        assert!(decide(&readings, &policy).admitted);
     }
 
     #[test]
@@ -326,10 +470,23 @@ mod tests {
             swap_free_bytes: Some(512 << 20),
             ..healthy()
         };
-        let verdict = decide(&readings, &Policy::default());
+        let verdict = decide(&readings, &swap_enforced());
         assert!(!verdict.admitted);
         assert_eq!(verdict.refusing.len(), 1);
         assert!(verdict.refusing[0].contains("swap free 512.0 MiB"));
+    }
+
+    #[test]
+    fn reports_swap_without_enforcing_it_by_default() {
+        // Free space inside the current swap files is not exhaustion: macOS
+        // grows swap while free disk allows.
+        let readings = Readings {
+            swap_free_bytes: Some(0),
+            swap_total_bytes: Some(4 << 30),
+            ..healthy()
+        };
+        let verdict = decide(&readings, &Policy::default());
+        assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
     }
 
     #[test]
@@ -355,7 +512,7 @@ mod tests {
             swap_free_bytes: Some(0),
             ..healthy()
         };
-        let verdict = decide(&readings, &Policy::default());
+        let verdict = decide(&readings, &swap_enforced());
         assert!(!verdict.admitted);
         assert_eq!(verdict.refusing.len(), 2);
         assert!(verdict.refusing[0].contains("pressure level 4 (critical)"));
@@ -369,7 +526,7 @@ mod tests {
             swap_total_bytes: Some(0),
             ..healthy()
         };
-        let verdict = decide(&readings, &Policy::default());
+        let verdict = decide(&readings, &swap_enforced());
         assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
     }
 
@@ -382,7 +539,7 @@ mod tests {
             swap_total_bytes: Some(1 << 30),
             ..healthy()
         };
-        let verdict = decide(&readings, &Policy::default());
+        let verdict = decide(&readings, &swap_enforced());
         assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
     }
 
@@ -393,19 +550,19 @@ mod tests {
             swap_total_bytes: Some(4 << 30),
             ..healthy()
         };
-        let verdict = decide(&readings, &Policy::default());
+        let verdict = decide(&readings, &swap_enforced());
         assert!(!verdict.admitted);
     }
 
     #[test]
     fn pressure_guards_the_zero_swap_total_interval() {
         let readings = Readings {
-            pressure_level: Some(2),
+            pressure_level: Some(4),
             swap_free_bytes: Some(0),
             swap_total_bytes: Some(0),
             ..healthy()
         };
-        let verdict = decide(&readings, &Policy::default());
+        let verdict = decide(&readings, &swap_enforced());
         assert!(!verdict.admitted);
         assert_eq!(verdict.refusing.len(), 1);
         assert!(verdict.refusing[0].contains("pressure"));
@@ -420,6 +577,43 @@ mod tests {
         let verdict = decide(&readings, &Policy::default());
         assert!(verdict.admitted);
         assert_eq!(verdict.unknown, ["pressure"]);
+    }
+
+    #[test]
+    fn unknown_swap_does_not_refuse_while_the_floor_is_disabled() {
+        // The default reports swap without enforcing it, so an unreadable swap
+        // signal is not a refusal even under --refuse-unknown.
+        let readings = Readings {
+            swap_free_bytes: None,
+            swap_total_bytes: None,
+            ..healthy()
+        };
+        let policy = Policy {
+            refuse_unknown: true,
+            ..Policy::default()
+        };
+        let verdict = decide(&readings, &policy);
+        assert!(verdict.admitted, "refused with {:?}", verdict.refusing);
+        assert!(verdict.unknown.contains(&"swap"));
+    }
+
+    #[test]
+    fn unknown_swap_refuses_once_the_floor_is_set() {
+        let readings = Readings {
+            swap_free_bytes: None,
+            swap_total_bytes: None,
+            ..healthy()
+        };
+        let policy = Policy {
+            refuse_unknown: true,
+            ..swap_enforced()
+        };
+        let verdict = decide(&readings, &policy);
+        assert!(!verdict.admitted);
+        assert!(verdict
+            .refusing
+            .iter()
+            .any(|r| r.contains("swap headroom is unknown")));
     }
 
     #[test]
