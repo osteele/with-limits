@@ -26,9 +26,11 @@ admission policy before it moved here, and had already diverged once.
 
 ## Decision Outcome
 
-A supervised run publishes a reservation — its process id, its budget, and its
-most recently sampled resident memory — into a shared per-user store for the
-life of the command. Admission reads the store under an exclusive lock, deducts
+A supervised run publishes a reservation — its process identity, its budget,
+and its most recently sampled resident memory — into a per-account store for
+the life of the command. Identity is the process id together with that
+process's start time, so an id the operating system later reuses does not
+inherit the record. Admission reads the store under an exclusive lock, deducts
 the unrealized part of every live promise from free memory, and only then
 compares against the floor. Reading, deciding, and publishing happen inside one
 critical section, so two callers arriving together see each other.
@@ -42,12 +44,22 @@ through, including agent hooks that wrap a command the model generated.
 
 - A previously stateless crate now keeps machine-local state, with the
   staleness and cleanup obligations that follow. Crash safety is a liveness
-  check rather than a lease: a reservation whose process is gone is ignored and
-  removed.
-- Coordination reaches only processes that can see the same store. `TMPDIR` is
-  per-user on macOS, so two accounts on one host do not see each other unless
-  pointed at a shared directory. Solving that properly means a world-writable
-  store where any account can publish a fabricated reservation.
+  check rather than a lease: a supervisor killed without running its cleanup
+  leaves a record, and the next scan reaps it once the process is gone or its
+  id has been reused by a process with a different start time. Where a
+  platform will not report a start time, identity falls back to the id alone
+  and a reused id is indistinguishable from the original — the one case the
+  check cannot cover.
+- **Coordination is per-account, and cross-account sharing is not available.**
+  On macOS `TMPDIR` is not merely per-user but mode 700, so two accounts on one
+  host cannot see each other's store even when both are willing: measured on
+  this workstation and on studio, where `agent` and the primary account each
+  hold a private store and neither can read the other's. Pointing both at one
+  configured directory does not rescue it either: the lock file and the records
+  are created 0600 by design, so a second account fails rather than shares. A
+  world-writable store would additionally let any account publish a fabricated
+  reservation, delete another's, or read what it is running. Treat reservations
+  as coordinating the processes of one account, and nothing wider.
 - Only an explicit absolute `--memory` publishes a reservation. A budget from
   `auto` or a percentage is a cap on whatever is free rather than a claim on an
   amount, and reserving it would let the first caller reserve most of the host
@@ -56,6 +68,16 @@ through, including agent hooks that wrap a command the model generated.
 - A reservation is a promise about growth that has not happened yet, so the
   deduction is deliberately conservative at the start of a command and decays
   as the tree grows into its budget.
+- **A store failure must not propagate past the process that hit it.** Two
+  paths were made to fail softly for this reason. Refreshing a live
+  reservation warns once and drops the reservation rather than propagating,
+  because the alternative killed the supervised command: the update runs on
+  the poll tick and ahead of graceful termination, so an error there converted
+  a documented memory-limit stop into an ungraceful kill. And a read takes the
+  lock only if it can, because a consumer that asks whether there is headroom
+  and receives an error treats it as "unknown" and drops its own memory gate
+  quietly, which is the opposite of what a gate is for. Publishing the initial
+  reservation stays fatal, since failing before the command starts is safe.
 
 ## Considered Options
 

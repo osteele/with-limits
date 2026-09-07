@@ -161,13 +161,20 @@ but does not refuse, because whether "cannot tell" is a refusal is the
 caller's policy; `--refuse-unknown` treats an unknown enforced signal as a
 refusal for the caller that wants that.
 
-An explicit absolute memory limit publishes an admission reservation for the
-life of the supervised command. For example, `--memory 8GiB` promises that the
-tree may grow to 8 GiB. Other admission checks subtract the unrealized part of
-that promise from free memory. The unrealized amount is the budget minus the
-tree's most recently sampled RSS, with a floor of zero. This avoids counting
-resident memory twice because the host's free-memory signal already reflects
-it. An observation older than 30 seconds contributes the full budget.
+An explicit absolute memory limit publishes an admission reservation. For
+example, `--memory 8GiB` promises that the tree may grow to 8 GiB. Other
+admission checks subtract the unrealized part of that promise from free memory.
+The unrealized amount is the budget minus the tree's most recently sampled RSS,
+with a floor of zero. This avoids counting resident memory twice because the
+host's free-memory signal already reflects it. An observation older than 30
+seconds contributes the full budget.
+
+The supervisor refreshes and retains its reservation while the store remains
+available. A refresh failure prints one warning, removes the reservation, and
+continues supervising and terminating the command. Each record includes the
+supervisor's process start time so a recycled process id does not keep an
+orphaned reservation alive. Platforms that cannot read a start time fall back
+to process-id liveness.
 
 The admission decision and reservation write share one exclusive file lock.
 Two callers that reach the gate together therefore make their decisions in
@@ -263,14 +270,11 @@ leaving idle CPU capacity available to them.
 admission-gate thresholds and accept the same values as their flags. The flags
 take precedence over the environment.
 
-`WITH_LIMITS_RESERVATION_DIR` selects the reservation store. Its default is
-`${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/with-limits-reservations`. The directory is
-created on demand with mode 0700, and each supervisor writes one JSON file named
-by its process id. Reservations coordinate only among processes that can see
-the same directory. macOS normally gives each user account a separate
-`TMPDIR`, so accounts on the same host need an explicitly configured shared
-directory to see one another's reservations. `with-limits` does not otherwise
-coordinate reservations across accounts.
+`WITH_LIMITS_RESERVATION_DIR` selects the per-account reservation store. Its
+default is `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/with-limits-reservations`. The
+directory is created on demand with mode 0700, and each supervisor writes one
+JSON file named by its process id. Configure it as a directory that only the
+current account can access. Reservations do not coordinate across accounts.
 
 ## Enforcement
 

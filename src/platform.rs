@@ -2,6 +2,12 @@ use crate::process_tree::ProcessIdentity;
 use anyhow::Result;
 use std::process::{Child, Command};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReservationProcess {
+    Dead,
+    Live { start_time: Option<u64> },
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -236,18 +242,35 @@ mod imp {
         Err(error).with_context(|| format!("could not signal process target {pid}"))
     }
 
-    /// `Some(false)` is returned only when the kernel reports that the PID
-    /// does not exist. Permission errors prove that a process occupies it.
-    pub fn process_is_alive(pid: u32) -> Result<Option<bool>> {
-        let pid = i32::try_from(pid).context("reservation PID is too large")?;
-        if unsafe { libc::kill(pid, 0) } == 0 {
-            return Ok(Some(true));
+    pub struct ReservationProcessChecker {
+        system: sysinfo::System,
+    }
+
+    impl ReservationProcessChecker {
+        pub fn new() -> Self {
+            Self {
+                system: sysinfo::System::new_all(),
+            }
         }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(Some(false)),
-            Some(libc::EPERM) => Ok(Some(true)),
-            _ => Err(error).with_context(|| format!("could not inspect reservation PID {pid}")),
+
+        pub fn inspect(&self, pid: u32) -> Result<ReservationProcess> {
+            if let Some(process) = self.system.process(sysinfo::Pid::from_u32(pid)) {
+                let start_time = process.start_time();
+                return Ok(ReservationProcess::Live {
+                    start_time: (start_time > 0).then_some(start_time),
+                });
+            }
+
+            let pid = i32::try_from(pid).context("reservation PID is too large")?;
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return Ok(ReservationProcess::Live { start_time: None });
+            }
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => Ok(ReservationProcess::Dead),
+                Some(libc::EPERM) => Ok(ReservationProcess::Live { start_time: None }),
+                _ => Err(error).with_context(|| format!("could not inspect reservation PID {pid}")),
+            }
         }
     }
 }
@@ -264,7 +287,8 @@ mod imp {
     };
     use windows_sys::Win32::{
         Foundation::{
-            CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, STILL_ACTIVE,
+            CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, FILETIME, HANDLE,
+            STILL_ACTIVE,
         },
         System::{
             JobObjects::{
@@ -275,8 +299,9 @@ mod imp {
                 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
             },
             Threading::{
-                CreateEventW, GetActiveProcessorCount, GetExitCodeProcess, OpenProcess, SetEvent,
-                BELOW_NORMAL_PRIORITY_CLASS, PROCESS_QUERY_LIMITED_INFORMATION,
+                CreateEventW, GetActiveProcessorCount, GetExitCodeProcess, GetProcessTimes,
+                OpenProcess, SetEvent, BELOW_NORMAL_PRIORITY_CLASS,
+                PROCESS_QUERY_LIMITED_INFORMATION,
             },
         },
     };
@@ -452,26 +477,59 @@ mod imp {
         Ok(())
     }
 
-    /// Access-denied leaves liveness unknown; callers keep the reservation in
-    /// that case so an unreadable process is never mistaken for a dead one.
-    pub fn process_is_alive(pid: u32) -> Result<Option<bool>> {
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if process.is_null() {
-            let error = std::io::Error::last_os_error();
-            return match error.raw_os_error().map(|code| code as u32) {
-                Some(ERROR_INVALID_PARAMETER) => Ok(Some(false)),
-                Some(ERROR_ACCESS_DENIED) => Ok(None),
-                _ => Err(error).with_context(|| format!("could not inspect reservation PID {pid}")),
+    pub struct ReservationProcessChecker;
+
+    impl ReservationProcessChecker {
+        pub fn new() -> Self {
+            Self
+        }
+
+        pub fn inspect(&self, pid: u32) -> Result<ReservationProcess> {
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+            if process.is_null() {
+                let error = std::io::Error::last_os_error();
+                return match error.raw_os_error().map(|code| code as u32) {
+                    Some(ERROR_INVALID_PARAMETER) => Ok(ReservationProcess::Dead),
+                    Some(ERROR_ACCESS_DENIED) => Ok(ReservationProcess::Live { start_time: None }),
+                    _ => Err(error)
+                        .with_context(|| format!("could not inspect reservation PID {pid}")),
+                };
+            }
+
+            let mut exit_code = 0;
+            if unsafe { GetExitCodeProcess(process, &mut exit_code) } == 0 {
+                unsafe { CloseHandle(process) };
+                return Ok(ReservationProcess::Live { start_time: None });
+            }
+            if exit_code != STILL_ACTIVE as u32 {
+                unsafe { CloseHandle(process) };
+                return Ok(ReservationProcess::Dead);
+            }
+
+            let mut creation_time = FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
             };
+            let mut exit_time = creation_time;
+            let mut kernel_time = creation_time;
+            let mut user_time = creation_time;
+            let result = unsafe {
+                GetProcessTimes(
+                    process,
+                    &mut creation_time,
+                    &mut exit_time,
+                    &mut kernel_time,
+                    &mut user_time,
+                )
+            };
+            unsafe { CloseHandle(process) };
+            let start_time = (result != 0).then(|| {
+                (u64::from(creation_time.dwHighDateTime) << 32)
+                    | u64::from(creation_time.dwLowDateTime)
+            });
+            Ok(ReservationProcess::Live { start_time })
         }
-        let mut exit_code = 0;
-        let result = unsafe { GetExitCodeProcess(process, &mut exit_code) };
-        unsafe { CloseHandle(process) };
-        if result == 0 {
-            return Ok(None);
-        }
-        Ok(Some(exit_code == STILL_ACTIVE as u32))
     }
 }
 
-pub use imp::{process_is_alive, Controller};
+pub use imp::{Controller, ReservationProcessChecker};

@@ -477,15 +477,29 @@ fn print_human_report(
     }
 }
 
-/// Poll the admission decision until admitted, then let the caller proceed to
-/// run the command. No signal handler is installed during the wait, so a
-/// terminating signal ends the process with the default disposition, as it
-/// does for any interrupted wrapper.
 enum WaitResult {
     Admitted(Option<Reservation>),
     Expired,
 }
 
+/// Whether a bounded wait must expire before consulting the host again.
+///
+/// `has_refused` is what keeps a bound from suppressing an immediate
+/// admission: the deadline governs how long the caller waits, so a host with
+/// headroom on the first look runs the command whatever the bound. Once a
+/// refusal has been observed and slept on, an elapsed bound is decisive, and
+/// the command does not run.
+fn wait_has_expired(elapsed: Duration, limit: Option<Duration>, has_refused: bool) -> bool {
+    match limit {
+        Some(limit) => has_refused && elapsed >= limit,
+        None => false,
+    }
+}
+
+/// Poll the admission decision until admitted, then let the caller proceed to
+/// run the command. No signal handler is installed during the wait, so a
+/// terminating signal ends the process with the default disposition, as it
+/// does for any interrupted wrapper.
 fn wait_for_admission(
     cli: &Cli,
     system: &mut System,
@@ -497,7 +511,24 @@ fn wait_for_admission(
     let started = Instant::now();
     let mut attempt = 0_u32;
     let mut last_notice: Option<Instant> = None;
+    // Why the deadline is tested before the reading rather than after the
+    // verdict: a bound exists so a caller can rely on "expired" meaning the
+    // command did not run. Admitting on the poll that follows an expired
+    // sleep would make that promise depend on which side of the deadline the
+    // host happened to recover, so the exit status would be racy where the
+    // documentation says it is decisive.
+    let mut last_refusing: Vec<String> = Vec::new();
     loop {
+        if let Some(limit) = max_wait {
+            if wait_has_expired(started.elapsed(), Some(limit), !last_refusing.is_empty()) {
+                eprintln!(
+                    "with-limits: headroom wait expired after {}: {}",
+                    HumanDuration(limit),
+                    last_refusing.join("; ")
+                );
+                return Ok(WaitResult::Expired);
+            }
+        }
         let readings = Readings::collect(system);
         let admission = reservation_store
             .map(|store| store.decide_and_reserve(&readings, &policy, reservation_budget))
@@ -516,6 +547,7 @@ fn wait_for_admission(
             return Ok(WaitResult::Admitted(reservation));
         }
         let elapsed = started.elapsed();
+        last_refusing = verdict.refusing.clone();
         if let Some(limit) = max_wait {
             if elapsed >= limit {
                 eprintln!(
@@ -885,7 +917,7 @@ fn supervise(
                 root_exited = true;
             }
         }
-        let usage = refresh_tree(&mut tree, system, &mut reservation)?;
+        let usage = refresh_tree(&mut tree, system, &mut reservation);
         if root_exited {
             tree.retire_root();
         }
@@ -1005,7 +1037,7 @@ fn supervise(
                         sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + Duration::from_millis(10),
                         deadline,
                     );
-                    refresh_tree(&mut tree, system, &mut reservation)?;
+                    refresh_tree(&mut tree, system, &mut reservation);
                     let targets = tree.identities();
                     controller.set_targets(&targets)?;
                     controller.resume(&targets)?;
@@ -1124,12 +1156,31 @@ fn refresh_tree(
     tree: &mut ProcessTree,
     system: &mut System,
     reservation: &mut Option<Reservation>,
-) -> Result<process_tree::Usage> {
+) -> process_tree::Usage {
     let usage = tree.refresh(system);
-    if let Some(reservation) = reservation {
-        reservation.update(usage.rss_bytes)?;
+    refresh_reservation(reservation, usage.rss_bytes);
+    usage
+}
+
+fn refresh_reservation(reservation: &mut Option<Reservation>, observed_rss_bytes: u64) {
+    refresh_reservation_with(reservation, |reservation| {
+        reservation.update(observed_rss_bytes)
+    });
+}
+
+fn refresh_reservation_with<F>(reservation: &mut Option<Reservation>, update: F)
+where
+    F: FnOnce(&mut Reservation) -> Result<()>,
+{
+    let error = reservation
+        .as_mut()
+        .and_then(|reservation| update(reservation).err());
+    if let Some(error) = error {
+        eprintln!(
+            "with-limits: warning: could not update memory reservation: {error:#}; reservation disabled"
+        );
+        drop(reservation.take());
     }
-    Ok(usage)
 }
 
 fn stop_command(
@@ -1140,7 +1191,7 @@ fn stop_command(
     reservation: &mut Option<Reservation>,
     grace: Duration,
 ) -> Result<()> {
-    refresh_tree(tree, system, reservation)?;
+    refresh_tree(tree, system, reservation);
     let mut targets = tree.identities();
     controller.set_targets(&targets)?;
     controller.terminate(&targets)?;
@@ -1151,7 +1202,7 @@ fn stop_command(
         child
             .try_wait()
             .context("could not inspect command during termination")?;
-        refresh_tree(tree, system, reservation)?;
+        refresh_tree(tree, system, reservation);
         targets = tree.identities();
         controller.set_targets(&targets)?;
         if tree.is_empty() {
@@ -1177,7 +1228,7 @@ fn force_command(
         child
             .try_wait()
             .context("could not inspect command after forced termination")?;
-        refresh_tree(tree, system, reservation)?;
+        refresh_tree(tree, system, reservation);
         targets = tree.identities();
         controller.set_targets(&targets)?;
         if tree.is_empty() {
@@ -1215,7 +1266,73 @@ fn display_program(program: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_immediate_admission_ignores_the_bound() {
+        // The bound governs waiting, not the first look: a host with headroom
+        // now runs the command however small the bound.
+        assert!(!wait_has_expired(
+            Duration::from_secs(10),
+            Some(Duration::from_millis(1)),
+            false
+        ));
+    }
+
+    #[test]
+    fn a_refused_wait_expires_at_its_bound() {
+        assert!(wait_has_expired(
+            Duration::from_millis(1),
+            Some(Duration::from_millis(1)),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_refused_wait_within_its_bound_keeps_waiting() {
+        assert!(!wait_has_expired(
+            Duration::from_millis(1),
+            Some(Duration::from_secs(10)),
+            true
+        ));
+    }
+
+    #[test]
+    fn an_unbounded_wait_never_expires() {
+        assert!(!wait_has_expired(Duration::from_secs(86_400), None, true));
+    }
     use super::*;
+
+    #[test]
+    fn a_reservation_refresh_failure_deactivates_and_removes_the_record() {
+        let store_path = std::env::temp_dir().join(format!(
+            "with-limits-refresh-failure-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if store_path.exists() {
+            std::fs::remove_dir_all(&store_path).expect("remove stale reservation test store");
+        }
+        let store = ReservationStore::new(store_path.clone());
+        let reservation = store.reserve(1_024).expect("publish test reservation");
+        let record_path = store_path.join(std::process::id().to_string());
+        assert!(record_path.exists());
+        let mut reservation = Some(reservation);
+        let update_calls = std::cell::Cell::new(0);
+
+        refresh_reservation_with(&mut reservation, |_| {
+            update_calls.set(update_calls.get() + 1);
+            Err(anyhow::anyhow!("simulated reservation write failure"))
+        });
+        refresh_reservation_with(&mut reservation, |_| {
+            update_calls.set(update_calls.get() + 1);
+            Ok(())
+        });
+
+        assert_eq!(update_calls.get(), 1);
+        assert!(reservation.is_none());
+        assert!(!record_path.exists());
+        std::fs::remove_dir_all(&store_path).expect("remove reservation test store");
+    }
 
     const MACOS_MEMORY_PRESSURE: &str = "The system has 17179869184 (1048576 pages with a page size of 16384).\nSystem-wide memory free percentage: 34%\n";
 
