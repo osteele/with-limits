@@ -144,6 +144,15 @@ struct Cli {
     #[arg(long)]
     refuse_unknown: bool,
 
+    /// Memory estimate to publish for admission, independent of --memory
+    #[arg(
+        long,
+        value_name = "SIZE",
+        value_parser = parse_reservation_size,
+        conflicts_with_all = ["check_headroom", "no_reservation"]
+    )]
+    reserve: Option<u64>,
+
     /// Ignore outstanding reservations and do not publish one
     #[arg(long)]
     no_reservation: bool,
@@ -198,7 +207,7 @@ fn run() -> Result<CommandResult> {
     } else {
         cli.memory
     };
-    let reservation_budget = reservation_budget(memory_spec, cli.no_reservation);
+    let reservation_budget = reservation_budget(memory_spec, cli.reserve, cli.no_reservation);
     let reservation_store = (!cli.no_reservation).then(ReservationStore::configured);
     let mut system = System::new_all();
     system.refresh_memory();
@@ -277,14 +286,18 @@ fn run() -> Result<CommandResult> {
     )
 }
 
-fn reservation_budget(spec: Option<MemorySpec>, disabled: bool) -> Option<u64> {
+fn reservation_budget(
+    spec: Option<MemorySpec>,
+    explicit: Option<u64>,
+    disabled: bool,
+) -> Option<u64> {
     if disabled {
         return None;
     }
-    match spec {
+    explicit.or(match spec {
         Some(MemorySpec::Bytes(bytes)) => Some(bytes),
         Some(MemorySpec::AvailableFraction(_)) | None => None,
-    }
+    })
 }
 
 fn resolve_memory_budget(spec: Option<MemorySpec>, available: u64) -> Result<MemoryBudget> {
@@ -571,6 +584,16 @@ fn wait_for_admission(
         }
         thread::sleep(sleep);
         attempt += 1;
+    }
+}
+
+/// Parse an admission reservation as an absolute memory size.
+fn parse_reservation_size(value: &str) -> Result<u64, String> {
+    match value.parse::<MemorySpec>()? {
+        MemorySpec::Bytes(bytes) => Ok(bytes),
+        MemorySpec::AvailableFraction(_) => {
+            Err("the reservation takes an absolute size, not a percentage or auto".into())
+        }
     }
 }
 
@@ -1463,18 +1486,26 @@ mod tests {
     }
 
     #[test]
-    fn only_absolute_memory_limits_publish_reservations() {
+    fn explicit_reservations_override_memory_derived_budgets() {
         assert_eq!(
-            reservation_budget(Some(MemorySpec::Bytes(4_096)), false),
+            reservation_budget(Some(MemorySpec::Bytes(4_096)), None, false),
             Some(4_096)
         );
         assert_eq!(
-            reservation_budget(Some(MemorySpec::AvailableFraction(0.7)), false),
+            reservation_budget(Some(MemorySpec::AvailableFraction(0.7)), Some(2_048), false),
+            Some(2_048)
+        );
+        assert_eq!(
+            reservation_budget(Some(MemorySpec::Bytes(4_096)), Some(2_048), false),
+            Some(2_048)
+        );
+        assert_eq!(
+            reservation_budget(Some(MemorySpec::AvailableFraction(0.7)), None, false),
             None
         );
-        assert_eq!(reservation_budget(None, false), None);
+        assert_eq!(reservation_budget(None, None, false), None);
         assert_eq!(
-            reservation_budget(Some(MemorySpec::Bytes(4_096)), true),
+            reservation_budget(Some(MemorySpec::Bytes(4_096)), Some(2_048), true),
             None
         );
     }
@@ -1487,6 +1518,17 @@ mod tests {
         for value in ["", "50%", "auto", "-1", "0.5", "1XB"] {
             assert!(
                 parse_swap_floor(value).is_err(),
+                "unexpectedly accepted {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_only_absolute_reservation_sizes() {
+        assert_eq!(parse_reservation_size("2GiB").unwrap(), 2 << 30);
+        for value in ["50%", "auto"] {
+            assert!(
+                parse_reservation_size(value).is_err(),
                 "unexpectedly accepted {value:?}"
             );
         }

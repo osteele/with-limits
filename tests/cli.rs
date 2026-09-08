@@ -755,7 +755,7 @@ fn an_absolute_command_refreshes_and_releases_its_reservation() {
 }
 
 #[test]
-fn concurrent_waiters_reserve_admission_for_only_one_command() {
+fn concurrent_waiters_with_auto_caps_reserve_admission_for_only_one_command() {
     let _guard = resource_test_guard();
     let store = temp_path("admission-store");
     let first_marker = temp_path("admission-first");
@@ -783,7 +783,7 @@ fn concurrent_waiters_reserve_admission_for_only_one_command() {
         free_bytes >= 256 << 20,
         "acceptance test requires at least 256 MiB free"
     );
-    let budget = free_bytes / 4 * 3;
+    let budget = free_bytes / 5 * 3;
     let floor = free_percent / 2.0;
 
     let contender = |marker: &std::path::Path| {
@@ -792,6 +792,8 @@ fn concurrent_waiters_reserve_admission_for_only_one_command() {
             .args([
                 "--wait-for-headroom=1s",
                 "--memory",
+                "auto",
+                "--reserve",
                 &budget.to_string(),
                 "--max-pressure",
                 "4",

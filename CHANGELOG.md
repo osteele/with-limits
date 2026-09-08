@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Forward `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`, `SIGTSTP`, and `SIGCONT` to Unix command trees according to their native roles
+- Independent `--reserve SIZE` admission estimates for commands using `--memory auto` or percentage caps
 
 ### Fixed
 - Force externally signaled Unix process trees to stop after `--kill-after` when they ignore graceful termination

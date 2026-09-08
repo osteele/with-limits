@@ -98,6 +98,9 @@ Options:
 - `--memory SIZE`, `-m SIZE` limits aggregate resident memory. Sizes accept SI
   suffixes such as `GB`, IEC suffixes such as `GiB`, `auto`, or a percentage of
   initially available memory such as `60%`.
+- `--reserve SIZE` publishes an absolute memory estimate for admission,
+  independently of the containment cap. An explicit absolute `--memory` size
+  is also the reservation when this option is absent.
 - `--cpu CORES` limits sustained CPU use, where `1` is the capacity of one
   logical core. Fractional values such as `0.5` are accepted; the minimum is
   `0.01`.
@@ -161,13 +164,14 @@ but does not refuse, because whether "cannot tell" is a refusal is the
 caller's policy; `--refuse-unknown` treats an unknown enforced signal as a
 refusal for the caller that wants that.
 
-An explicit absolute memory limit publishes an admission reservation. For
-example, `--memory 8GiB` promises that the tree may grow to 8 GiB. Other
+An explicit absolute reservation publishes an admission promise. For example,
+`--memory auto --reserve 3GiB` allows the tree to use the automatic containment
+cap while asking admission checks to assume about 3 GiB of growth. Other
 admission checks subtract the unrealized part of that promise from free memory.
-The unrealized amount is the budget minus the tree's most recently sampled RSS,
-with a floor of zero. This avoids counting resident memory twice because the
-host's free-memory signal already reflects it. An observation older than 30
-seconds contributes the full budget.
+The unrealized amount is the reservation minus the tree's most recently
+sampled RSS, with a floor of zero. A tree that grows past its reservation
+contributes no unrealized bytes but remains governed by its independent memory
+cap. An observation older than 30 seconds contributes the full reservation.
 
 The supervisor refreshes and retains its reservation while the store remains
 available. A refresh failure prints one warning, removes the reservation, and
@@ -182,12 +186,21 @@ sequence, and the second sees the first caller's promise. The lock is held only
 while reading, deciding, and writing. It is released before the command or a
 headroom wait begins.
 
-`auto` and percentage memory limits do not publish reservations. They cap a
-tree relative to whatever memory is free, rather than claiming a fixed amount.
-Reserving such a limit would let the first caller claim most of the host and
-serialize later work. Pass an absolute `--memory` size when admission
-coordination is required. `--check-headroom` reads reservations but never
-creates one.
+`auto` and percentage memory limits do not implicitly publish reservations.
+They cap a tree relative to whatever memory is free, so using the cap as the
+promise would let the first caller claim most of the host and serialize later
+work. Pair either form with an absolute estimate when admission coordination is
+required:
+
+```sh
+with-limits --wait-for-headroom=15m --memory auto --reserve 3GiB -- command
+```
+
+An absolute `--memory` size remains an implicit reservation when `--reserve` is
+absent. `--reserve` is valid without `--memory`. When it is the only resource
+option, the usual default `--memory auto` containment applies. If `--cpu` or
+`--time` is also present, omitting `--memory` leaves memory uncapped.
+`--check-headroom` reads reservations but never creates one.
 
 `with-limits --check-headroom` reads the signals and outstanding reservations,
 applies the policy, prints one line per signal plus the reservation count and
@@ -225,6 +238,9 @@ limit options the default `--memory auto` applies as usual.
 - `--max-load-per-cpu CORES` enforces a load ceiling. Without it, load is
   reported but never refuses.
 - `--refuse-unknown` treats an unknown enforced signal as a refusal.
+- `--reserve SIZE` sets the absolute estimate published when the command is
+  admitted. It overrides the implicit reservation from an absolute
+  `--memory` size and is valid without an explicit memory cap.
 - `--no-reservation` bypasses the reservation store for this invocation. It
   neither subtracts other reservations nor publishes its own.
 
