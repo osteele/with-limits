@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Seed `PYTORCH_MPS_HIGH_WATERMARK_RATIO` and `PYTORCH_MPS_LOW_WATERMARK_RATIO` for guarded trees on macOS, so PyTorch's Metal allocator respects roughly the share the guard enforces; override with `WITH_LIMITS_MPS_*_WATERMARK_RATIO` or disable with `WITH_LIMITS_MPS_WATERMARKS=off`
 - Forward `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`, `SIGTSTP`, and `SIGCONT` to Unix command trees according to their native roles
 - Independent `--reserve SIZE` admission estimates for commands using `--memory auto` or percentage caps
 

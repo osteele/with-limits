@@ -281,6 +281,15 @@ The priority does not change in response to load or the number of running
 agents. Fixed lower priority lets foreground work preempt background jobs while
 leaving idle CPU capacity available to them.
 
+On macOS, guarded commands receive `PYTORCH_MPS_HIGH_WATERMARK_RATIO` (`0.7`)
+and `PYTORCH_MPS_LOW_WATERMARK_RATIO` (`0.6`) unless the environment already
+sets them. A process-tree ceiling does not reach PyTorch's Metal allocator,
+which sizes its pool against total system memory; without the watermarks the
+tree is killed for an allocation the guard never had a chance to refuse.
+`WITH_LIMITS_MPS_HIGH_WATERMARK_RATIO` and
+`WITH_LIMITS_MPS_LOW_WATERMARK_RATIO` change the seeded ratios;
+`WITH_LIMITS_MPS_WATERMARKS=off` disables the seeding.
+
 `WITH_LIMITS_MAX_PRESSURE`, `WITH_LIMITS_MIN_MEMORY_FREE_PERCENT`,
 `WITH_LIMITS_MIN_SWAP_FREE`, and `WITH_LIMITS_MAX_LOAD_PER_CPU` set the
 admission-gate thresholds and accept the same values as their flags. The flags

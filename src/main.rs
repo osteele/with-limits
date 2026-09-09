@@ -237,6 +237,9 @@ fn run() -> Result<CommandResult> {
     let nice_adjustment = configured_nice_adjustment()?;
     let mut command = build_command(&cli)?;
     command.env("WITH_LIMITS_ACTIVE", "1");
+    for (name, value) in mps_watermarks(&|name| std::env::var_os(name)) {
+        command.env(name, value);
+    }
 
     let mut controller = platform::Controller::prepare(&mut command, memory, cpu, nice_adjustment)?;
     if cli.require_native {
@@ -658,6 +661,54 @@ fn parse_nice_adjustment(value: Option<&OsStr>) -> Result<Option<i32>> {
         bail!("WITH_LIMITS_NICE must be from 1 through 19, or off");
     }
     Ok(Some(adjustment))
+}
+
+/// Default PyTorch MPS watermarks for the guarded tree, on macOS.
+///
+/// A memory ceiling on the process tree does not reach PyTorch's Metal
+/// allocator, which sizes its own pool against total system memory and will
+/// happily claim past the ceiling: the tree is killed for an allocation the
+/// guard never had a chance to refuse. Seeding the watermarks makes the
+/// allocator respect roughly the same share the guard does.
+///
+/// Only defaults. An explicit `PYTORCH_MPS_*` in the environment is the
+/// caller's decision and passes through untouched; `WITH_LIMITS_MPS_*`
+/// overrides the ratio without having to know PyTorch's variable names, and
+/// `WITH_LIMITS_MPS_WATERMARKS=off` disables the seeding entirely.
+fn mps_watermarks(var: &dyn Fn(&str) -> Option<OsString>) -> Vec<(&'static str, String)> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let value = |name: &str| var(name).and_then(|v| v.into_string().ok());
+    if value("WITH_LIMITS_MPS_WATERMARKS").is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no"
+        )
+    }) {
+        return Vec::new();
+    }
+    [
+        (
+            "PYTORCH_MPS_HIGH_WATERMARK_RATIO",
+            "WITH_LIMITS_MPS_HIGH_WATERMARK_RATIO",
+            "0.7",
+        ),
+        (
+            "PYTORCH_MPS_LOW_WATERMARK_RATIO",
+            "WITH_LIMITS_MPS_LOW_WATERMARK_RATIO",
+            "0.6",
+        ),
+    ]
+    .into_iter()
+    .filter(|(pytorch, _, _)| value(pytorch).is_none())
+    .map(|(pytorch, override_name, default)| {
+        (
+            pytorch,
+            value(override_name).unwrap_or_else(|| default.to_string()),
+        )
+    })
+    .collect()
 }
 
 fn available_memory(system: &mut System) -> Result<u64> {
@@ -1289,6 +1340,66 @@ fn display_program(program: &OsStr) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(target_os = "macos")]
+    fn watermarks(pairs: &[(&str, &str)]) -> Vec<(&'static str, String)> {
+        let owned: Vec<(String, OsString)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), OsString::from(*v)))
+            .collect();
+        super::mps_watermarks(&move |name: &str| {
+            owned
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_empty_environment_gets_both_default_watermarks() {
+        assert_eq!(
+            watermarks(&[]),
+            vec![
+                ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.7".to_string()),
+                ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_explicit_pytorch_watermark_is_left_alone() {
+        // Seeding a default must never overwrite a decision the caller already
+        // made, and must not disturb the sibling it did not set.
+        assert_eq!(
+            watermarks(&[("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.95")]),
+            vec![("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6".to_string())]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_with_limits_override_replaces_the_default_ratio() {
+        assert_eq!(
+            watermarks(&[("WITH_LIMITS_MPS_HIGH_WATERMARK_RATIO", "0.5")]),
+            vec![
+                ("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.5".to_string()),
+                ("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.6".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_seeding_can_be_switched_off() {
+        for spelling in ["off", "OFF", "0", "false", "no"] {
+            assert!(
+                watermarks(&[("WITH_LIMITS_MPS_WATERMARKS", spelling)]).is_empty(),
+                "{spelling} should disable watermark seeding"
+            );
+        }
+    }
 
     #[test]
     fn an_immediate_admission_ignores_the_bound() {
