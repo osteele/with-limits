@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Independent `--reserve SIZE` admission estimates for commands using `--memory auto` or percentage caps
 
 ### Fixed
+- Name the shared-`/tmp` fallback reservation store by user id, refuse a store that is a symlink, owned by another account, or writable by others, and never follow a symlink planted at a record or lock path
 - On macOS, read available memory from `kern.memorystatus_level`, so `auto` and percentage caps and the host reserve no longer collapse to a few MiB on a host whose memory compressor is large
 - A supervisor's reservation refresh skips a tick instead of waiting when another process holds the reservation store lock, so a stalled holder cannot pause memory and time enforcement
 - Check only the reservation processes a scan needs instead of snapshotting the whole process table while holding the store lock

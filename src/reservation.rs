@@ -64,6 +64,7 @@ impl ReservationStore {
             std::env::var_os("WITH_LIMITS_RESERVATION_DIR"),
             std::env::var_os("XDG_RUNTIME_DIR"),
             std::env::var_os("TMPDIR"),
+            fallback_store_path(),
         ))
     }
 
@@ -73,6 +74,18 @@ impl ReservationStore {
         policy: &Policy,
     ) -> Result<(Verdict, OutstandingReservations)> {
         let now = unix_millis()?;
+        #[cfg(unix)]
+        if fs::symlink_metadata(&self.path).is_ok() {
+            if let Err(error) = validate_store_directory(&self.path) {
+                // Records in a store another account can write prove nothing
+                // about this account's work, and counting them would let that
+                // account refuse admission at will.
+                eprintln!("with-limits: warning: ignoring reservations: {error:#}");
+                let outstanding = OutstandingReservations::default();
+                let verdict = headroom::decide_with_reservations(readings, policy, outstanding);
+                return Ok((verdict, outstanding));
+            }
+        }
         // A read takes the lock when it can and proceeds without it when it
         // cannot. Mutual exclusion makes a read's view consistent; it is not
         // what makes the answer correct, since each record is a separate file
@@ -195,7 +208,7 @@ impl ReservationStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         options
             .open(&lock_path)
@@ -410,16 +423,33 @@ pub fn resolve_store_path(
     configured: Option<OsString>,
     xdg_runtime_dir: Option<OsString>,
     tmpdir: Option<OsString>,
+    fallback: PathBuf,
 ) -> PathBuf {
     if let Some(path) = configured.filter(|path| !path.is_empty()) {
         return PathBuf::from(path);
     }
-    let parent = xdg_runtime_dir
+    xdg_runtime_dir
         .filter(|path| !path.is_empty())
         .or_else(|| tmpdir.filter(|path| !path.is_empty()))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    parent.join("with-limits-reservations")
+        .map(|parent| PathBuf::from(parent).join("with-limits-reservations"))
+        .unwrap_or(fallback)
+}
+
+/// The store used when neither `XDG_RUNTIME_DIR` nor `TMPDIR` names a
+/// per-account directory. `/tmp` is shared by every account, so the store
+/// name carries the effective user id; without it the first account to run
+/// would own the store and every other account's runs would fail.
+#[cfg(unix)]
+fn fallback_store_path() -> PathBuf {
+    let uid = unsafe { libc::geteuid() };
+    PathBuf::from(format!("/tmp/with-limits-reservations-{uid}"))
+}
+
+/// The store used when neither `XDG_RUNTIME_DIR` nor `TMPDIR` is set. The
+/// Windows temporary directory is already per-account.
+#[cfg(windows)]
+fn fallback_store_path() -> PathBuf {
+    std::env::temp_dir().join("with-limits-reservations")
 }
 
 fn unix_millis() -> Result<u64> {
@@ -431,28 +461,68 @@ fn unix_millis() -> Result<u64> {
 }
 
 fn ensure_store_directory(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Ok(());
-    }
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true).mode(0o700);
-        match builder.create(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-            Err(error) => Err(error)
-                .with_context(|| format!("could not create reservation store {}", path.display())),
+        if fs::symlink_metadata(path).is_err() {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("could not create reservation store {}", path.display())
+                    })
+                }
+            }
         }
+        validate_store_directory(path)
     }
 
     #[cfg(not(unix))]
     {
+        if path.exists() {
+            return Ok(());
+        }
         fs::create_dir_all(path)
             .with_context(|| format!("could not create reservation store {}", path.display()))
     }
+}
+
+/// Refuse a store this account does not exclusively control. Another account
+/// that can write the directory can plant records that block admission, or
+/// symlinks that redirect this supervisor's writes into files it owns.
+#[cfg(unix)]
+fn validate_store_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("could not inspect reservation store {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "reservation store {} is a symbolic link; refusing to use it",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        anyhow::bail!("reservation store {} is not a directory", path.display());
+    }
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        anyhow::bail!(
+            "reservation store {} is owned by uid {}, not this account (uid {uid}); refusing to use it",
+            path.display(),
+            metadata.uid()
+        );
+    }
+    if metadata.mode() & 0o022 != 0 {
+        anyhow::bail!(
+            "reservation store {} is writable by other accounts (mode {:o}); refusing to use it",
+            path.display(),
+            metadata.mode() & 0o777
+        );
+    }
+    Ok(())
 }
 
 fn write_record(path: &Path, record: &ReservationRecord) -> Result<()> {
@@ -461,7 +531,7 @@ fn write_record(path: &Path, record: &ReservationRecord) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options
         .open(path)
@@ -628,6 +698,12 @@ mod tests {
                 fs::remove_dir_all(&path).expect("remove stale test reservation directory");
             }
             fs::create_dir(&path).expect("create test reservation directory");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+                    .expect("make test reservation directory private");
+            }
             Self(path)
         }
     }
@@ -715,37 +791,147 @@ mod tests {
             resolve_store_path(
                 Some("/configured".into()),
                 Some("/xdg".into()),
-                Some("/tmpdir".into())
+                Some("/tmpdir".into()),
+                PathBuf::from("/fallback")
             ),
             PathBuf::from("/configured")
         );
         assert_eq!(
-            resolve_store_path(None, Some("/xdg".into()), Some("/tmpdir".into())),
+            resolve_store_path(
+                None,
+                Some("/xdg".into()),
+                Some("/tmpdir".into()),
+                PathBuf::from("/fallback")
+            ),
             PathBuf::from("/xdg/with-limits-reservations")
         );
         assert_eq!(
-            resolve_store_path(None, None, Some("/tmpdir".into())),
+            resolve_store_path(
+                None,
+                None,
+                Some("/tmpdir".into()),
+                PathBuf::from("/fallback")
+            ),
             PathBuf::from("/tmpdir/with-limits-reservations")
         );
         assert_eq!(
-            resolve_store_path(None, None, None),
-            PathBuf::from("/tmp/with-limits-reservations")
+            resolve_store_path(None, None, None, PathBuf::from("/fallback")),
+            PathBuf::from("/fallback")
         );
         assert_eq!(
             resolve_store_path(
                 Some(OsString::new()),
                 Some("/xdg".into()),
-                Some("/tmpdir".into())
+                Some("/tmpdir".into()),
+                PathBuf::from("/fallback")
             ),
             PathBuf::from("/xdg/with-limits-reservations")
         );
         assert_eq!(
-            resolve_store_path(None, Some(OsString::new()), Some("/tmpdir".into())),
+            resolve_store_path(
+                None,
+                Some(OsString::new()),
+                Some("/tmpdir".into()),
+                PathBuf::from("/fallback")
+            ),
             PathBuf::from("/tmpdir/with-limits-reservations")
         );
         assert_eq!(
-            resolve_store_path(None, None, Some(OsString::new())),
-            PathBuf::from("/tmp/with-limits-reservations")
+            resolve_store_path(
+                None,
+                None,
+                Some(OsString::new()),
+                PathBuf::from("/fallback")
+            ),
+            PathBuf::from("/fallback")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_shared_tmp_fallback_is_per_account() {
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(
+            fallback_store_path(),
+            PathBuf::from(format!("/tmp/with-limits-reservations-{uid}"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_store_other_accounts_could_write_or_redirect() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = TestDirectory::new("untrusted-store");
+        for (name, mode) in [("group", 0o770), ("world", 0o707)] {
+            let shared = parent.0.join(name);
+            fs::create_dir(&shared).expect("create shared store");
+            fs::set_permissions(&shared, fs::Permissions::from_mode(mode))
+                .expect("make the store writable by others");
+            let error = ReservationStore::new(shared.clone())
+                .reserve(1)
+                .err()
+                .unwrap_or_else(|| panic!("a {name}-writable store is refused"));
+            assert!(format!("{error:#}").contains("writable by other accounts"));
+            assert!(!shared.join(std::process::id().to_string()).exists());
+        }
+
+        let private = parent.0.join("private");
+        fs::create_dir(&private).expect("create private store");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700))
+            .expect("make the store private");
+        let link = parent.0.join("link");
+        std::os::unix::fs::symlink(&private, &link).expect("link to the private store");
+        let error = ReservationStore::new(link)
+            .reserve(1)
+            .err()
+            .expect("a symlinked store is refused");
+        assert!(format!("{error:#}").contains("symbolic link"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_read_ignores_records_in_a_store_other_accounts_can_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("untrusted-read");
+        let store = ReservationStore::new(directory.0.clone());
+        let record = fixture_record(
+            std::process::id(),
+            None,
+            15 << 30,
+            0,
+            unix_millis().unwrap(),
+        );
+        write_fixture(&store, &record);
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o777))
+            .expect("make the store world-writable");
+
+        let (verdict, outstanding) = store
+            .inspect(&healthy_readings(), &Policy::default())
+            .expect("answer admission over an untrusted store");
+        assert!(
+            verdict.admitted,
+            "a planted reservation must not refuse admission"
+        );
+        assert_eq!(outstanding.count, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_record_write_does_not_follow_a_planted_symlink() {
+        let directory = TestDirectory::new("planted-record");
+        let victim = directory.0.join("victim");
+        fs::write(&victim, "original").expect("write victim file");
+        let store = ReservationStore::new(directory.0.join("store"));
+        store.acquire_lock().expect("create the store");
+        std::os::unix::fs::symlink(&victim, store.record_path(std::process::id()))
+            .expect("plant a symlink at the record path");
+
+        assert!(store.reserve(1).is_err());
+        assert_eq!(
+            fs::read_to_string(&victim).expect("read victim file"),
+            "original"
         );
     }
 

@@ -301,10 +301,16 @@ admission-gate thresholds and accept the same values as their flags. The flags
 take precedence over the environment.
 
 `WITH_LIMITS_RESERVATION_DIR` selects the per-account reservation store. Its
-default is `${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/with-limits-reservations`. The
-directory is created on demand with mode 0700, and each supervisor writes one
-JSON file named by its process id. Configure it as a directory that only the
-current account can access. Reservations do not coordinate across accounts.
+default is `$XDG_RUNTIME_DIR/with-limits-reservations`, then
+`$TMPDIR/with-limits-reservations`. When neither variable is set it is
+`/tmp/with-limits-reservations-UID` on Unix, named by the effective user id
+because `/tmp` is shared by every account, and the temporary directory on
+Windows. The directory is created on demand with mode 0700, and each
+supervisor writes one JSON file named by its process id. On Unix a store that
+is a symbolic link, is owned by another account, or is writable by group or
+others is refused: a command that would publish a reservation or wait for
+headroom fails before it starts, and `--check-headroom` ignores the store's
+records with a warning. Reservations do not coordinate across accounts.
 
 ## Enforcement
 
