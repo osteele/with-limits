@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use sysinfo::{ProcessesToUpdate, System};
+use sysinfo::{ProcessStatus, ProcessesToUpdate, System};
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Usage {
@@ -34,6 +34,11 @@ struct ProcessSnapshot {
     start_time: u64,
     rss_bytes: u64,
     cpu_percent: f64,
+    /// A zombie: exited, and waiting for a parent that may never reap it.
+    /// It holds no memory, runs no code, and no signal changes it, so for
+    /// every purpose the tree serves it is gone, and keeping it would wait on
+    /// a parent outside the tree or turn a forced termination into a failure.
+    exited: bool,
 }
 
 impl ProcessTree {
@@ -59,6 +64,9 @@ impl ProcessTree {
                 start_time: process.start_time(),
                 rss_bytes: process.memory(),
                 cpu_percent: f64::from(process.cpu_usage()),
+                // Only `Zombie` means exited everywhere: on macOS sysinfo
+                // reports an uninterruptible thread state as `Dead`.
+                exited: matches!(process.status(), ProcessStatus::Zombie),
             })
             .collect();
         let group = self.group;
@@ -71,9 +79,11 @@ impl ProcessTree {
     /// a process belongs to the command's process group; it is consulted only
     /// for processes the parent chain did not already reach.
     fn update(&mut self, snapshots: &[ProcessSnapshot], in_group: impl Fn(u32) -> bool) -> Usage {
+        let snapshots: Vec<&ProcessSnapshot> =
+            snapshots.iter().filter(|process| !process.exited).collect();
         let by_pid: HashMap<_, _> = snapshots
             .iter()
-            .map(|process| (process.pid, process))
+            .map(|process| (process.pid, *process))
             .collect();
 
         self.known.retain(|pid, start_time| {
@@ -152,6 +162,15 @@ impl ProcessTree {
         self.known.is_empty()
     }
 
+    /// Whether the command is finished: nothing tracked remains, and no
+    /// process is left in its process group. A process-table snapshot can
+    /// miss a member forked moments before the command exited, so the group
+    /// itself is the authority on whether members remain; a later poll then
+    /// adopts the member the snapshot missed.
+    pub fn is_finished(&self) -> bool {
+        self.is_empty() && !self.group.is_some_and(group_has_members)
+    }
+
     pub fn observed_root(&self) -> bool {
         self.root_identity.is_some()
     }
@@ -186,6 +205,17 @@ fn process_group(_pid: u32) -> Option<u32> {
     None
 }
 
+/// Whether any process remains in `group`, the command's own process group.
+#[cfg(unix)]
+fn group_has_members(group: u32) -> bool {
+    i32::try_from(group).is_ok_and(|group| unsafe { libc::killpg(group, 0) } == 0)
+}
+
+#[cfg(not(unix))]
+fn group_has_members(_group: u32) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +233,14 @@ mod tests {
             start_time,
             rss_bytes,
             cpu_percent,
+            exited: false,
+        }
+    }
+
+    fn zombie(pid: u32, parent: Option<u32>, start_time: u64) -> ProcessSnapshot {
+        ProcessSnapshot {
+            exited: true,
+            ..process(pid, parent, start_time, 0, 0.0)
         }
     }
 
@@ -239,6 +277,61 @@ mod tests {
         assert_eq!(usage.rss_bytes, 250);
         assert_eq!(identities(&tree), HashSet::from([(20, 2), (21, 3)]));
         assert!(!tree.is_empty());
+    }
+
+    #[test]
+    fn treats_a_zombie_as_absent() {
+        // An orphan that exited under a parent which never reaps it stays in
+        // the table with its group intact. It must be neither adopted nor
+        // retained: nothing the supervisor can do removes it, so waiting for
+        // the tree to empty would wait forever and a forced termination would
+        // report it as a survivor.
+        let mut tree = ProcessTree::new(10, Some(10), true);
+        tree.update(
+            &[
+                process(10, Some(1), 1, 100, 10.0),
+                process(20, Some(10), 2, 200, 20.0),
+            ],
+            |_| false,
+        );
+
+        let usage = tree.update(
+            &[
+                process(10, Some(1), 1, 100, 10.0),
+                zombie(20, Some(10), 2),
+                zombie(30, Some(1), 3),
+            ],
+            |pid| pid == 30,
+        );
+
+        assert_eq!(usage.process_count, 1);
+        assert_eq!(identities(&tree), HashSet::from([(10, 1)]));
+
+        tree.retire_root();
+        tree.update(&[zombie(30, Some(1), 3)], |pid| pid == 30);
+        assert!(tree.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_not_finished_while_its_group_has_an_unobserved_member() {
+        // A snapshot taken as the command exits can miss a member it forked
+        // just before; the group still holds that member.
+        use std::os::unix::process::CommandExt;
+        let mut member = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("start a group member");
+        let group = member.id();
+        let tree = ProcessTree::new(group, Some(group), true);
+        assert!(tree.is_empty());
+        assert!(!tree.is_finished());
+
+        member.kill().expect("stop the group member");
+        member.wait().expect("reap the group member");
+        assert!(tree.is_finished());
+        assert!(ProcessTree::new(group, None, true).is_finished());
     }
 
     #[test]

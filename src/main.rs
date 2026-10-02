@@ -990,7 +990,7 @@ fn supervise(
         controller.set_targets(&targets)?;
 
         if let Some(status) = child_status {
-            if cfg!(windows) || tree.is_empty() {
+            if cfg!(windows) || tree.is_finished() {
                 controller.disarm();
                 return Ok(CommandResult::Status(status));
             }
@@ -1005,7 +1005,7 @@ fn supervise(
             // process group may already have been adopted: they still run
             // under the limits, as they would had the command been observed.
             tree.retire_root();
-            if cfg!(windows) || tree.is_empty() {
+            if cfg!(windows) || tree.is_finished() {
                 controller.disarm();
                 return Ok(CommandResult::Status(status));
             }
