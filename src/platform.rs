@@ -242,6 +242,12 @@ mod imp {
         Err(error).with_context(|| format!("could not signal process target {pid}"))
     }
 
+    /// Reports whether a reservation's process is live, and its start time.
+    ///
+    /// Each inspection refreshes only the process asked about. The scan runs
+    /// under the exclusive store lock, which every supervisor's refresh also
+    /// wants, and a snapshot of the whole process table costs tens to
+    /// hundreds of milliseconds on a busy host.
     pub struct ReservationProcessChecker {
         system: sysinfo::System,
     }
@@ -249,12 +255,18 @@ mod imp {
     impl ReservationProcessChecker {
         pub fn new() -> Self {
             Self {
-                system: sysinfo::System::new_all(),
+                system: sysinfo::System::new(),
             }
         }
 
-        pub fn inspect(&self, pid: u32) -> Result<ReservationProcess> {
-            if let Some(process) = self.system.process(sysinfo::Pid::from_u32(pid)) {
+        pub fn inspect(&mut self, pid: u32) -> Result<ReservationProcess> {
+            let target = sysinfo::Pid::from_u32(pid);
+            self.system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[target]),
+                true,
+                sysinfo::ProcessRefreshKind::nothing(),
+            );
+            if let Some(process) = self.system.process(target) {
                 let start_time = process.start_time();
                 return Ok(ReservationProcess::Live {
                     start_time: (start_time > 0).then_some(start_time),
@@ -484,7 +496,7 @@ mod imp {
             Self
         }
 
-        pub fn inspect(&self, pid: u32) -> Result<ReservationProcess> {
+        pub fn inspect(&mut self, pid: u32) -> Result<ReservationProcess> {
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
             if process.is_null() {
                 let error = std::io::Error::last_os_error();

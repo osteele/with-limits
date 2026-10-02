@@ -177,8 +177,10 @@ contributes no unrealized bytes but remains governed by its independent memory
 cap. An observation older than 30 seconds contributes the full reservation.
 
 The supervisor refreshes and retains its reservation while the store remains
-available. A refresh failure prints one warning, removes the reservation, and
-continues supervising and terminating the command. Each record includes the
+available. A refresh never waits for the store lock: when another process
+holds it, that tick's refresh is skipped. A refresh failure prints one warning,
+removes the reservation, and continues supervising and terminating the
+command. Each record includes the
 supervisor's process start time so a recycled process id does not keep an
 orphaned reservation alive. Platforms that cannot read a start time fall back
 to process-id liveness.

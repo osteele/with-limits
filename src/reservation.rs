@@ -88,7 +88,7 @@ impl ReservationStore {
         } else {
             ScanLockState::NotHeld
         };
-        let checker = ReservationProcessChecker::new();
+        let mut checker = ReservationProcessChecker::new();
         let scan = self.scan_with(now, lock_state, |pid| checker.inspect(pid))?;
         print_warnings(&scan.warnings);
         let verdict = headroom::decide_with_reservations(readings, policy, scan.outstanding);
@@ -103,13 +103,13 @@ impl ReservationStore {
     ) -> Result<Admission> {
         let now = unix_millis()?;
         let _lock = self.acquire_lock()?;
-        let checker = ReservationProcessChecker::new();
+        let mut checker = ReservationProcessChecker::new();
         let scan = self.scan_with(now, ScanLockState::Held, |pid| checker.inspect(pid))?;
         print_warnings(&scan.warnings);
         let verdict = headroom::decide_with_reservations(readings, policy, scan.outstanding);
         let reservation = if verdict.admitted {
             budget_bytes
-                .map(|budget| self.publish_locked(budget, now))
+                .map(|budget| self.publish_locked(budget, now, &mut checker))
                 .transpose()?
         } else {
             None
@@ -123,15 +123,20 @@ impl ReservationStore {
     pub fn reserve(&self, budget_bytes: u64) -> Result<Reservation> {
         let now = unix_millis()?;
         let _lock = self.acquire_lock()?;
-        let checker = ReservationProcessChecker::new();
+        let mut checker = ReservationProcessChecker::new();
         let scan = self.scan_with(now, ScanLockState::Held, |pid| checker.inspect(pid))?;
         print_warnings(&scan.warnings);
-        self.publish_locked(budget_bytes, now)
+        self.publish_locked(budget_bytes, now, &mut checker)
     }
 
-    fn publish_locked(&self, budget_bytes: u64, now: u64) -> Result<Reservation> {
+    fn publish_locked(
+        &self,
+        budget_bytes: u64,
+        now: u64,
+        checker: &mut ReservationProcessChecker,
+    ) -> Result<Reservation> {
         let pid = std::process::id();
-        let process_start_time = match ReservationProcessChecker::new().inspect(pid)? {
+        let process_start_time = match checker.inspect(pid)? {
             ReservationProcess::Live { start_time } => start_time,
             ReservationProcess::Dead => None,
         };
@@ -169,6 +174,20 @@ impl ReservationStore {
     }
 
     fn acquire_lock(&self) -> Result<StoreLock> {
+        let file = self.open_lock_file()?;
+        StoreLock::acquire(file)
+            .with_context(|| format!("could not lock reservation store {}", self.path.display()))
+    }
+
+    /// Take the store lock if it is free, or return `None` when another
+    /// holder has it.
+    fn try_acquire_lock(&self) -> Result<Option<StoreLock>> {
+        let file = self.open_lock_file()?;
+        StoreLock::try_acquire(file)
+            .with_context(|| format!("could not lock reservation store {}", self.path.display()))
+    }
+
+    fn open_lock_file(&self) -> Result<File> {
         ensure_store_directory(&self.path)?;
         let lock_path = self.path.join(LOCK_FILE);
         let mut options = OpenOptions::new();
@@ -178,11 +197,9 @@ impl ReservationStore {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options
+        options
             .open(&lock_path)
-            .with_context(|| format!("could not open reservation lock {}", lock_path.display()))?;
-        StoreLock::acquire(file)
-            .with_context(|| format!("could not lock reservation store {}", self.path.display()))
+            .with_context(|| format!("could not open reservation lock {}", lock_path.display()))
     }
 
     fn scan_with<F>(
@@ -347,9 +364,16 @@ where
 }
 
 impl Reservation {
+    /// Record the tree's latest RSS, or skip this tick when another process
+    /// holds the store lock. The update runs on the supervisor's enforcement
+    /// tick, so it must never wait for a holder that may be stalled; a record
+    /// that misses ticks for 30 seconds counts its full budget, which errs on
+    /// the side the reservation exists for.
     pub fn update(&mut self, observed_rss_bytes: u64) -> Result<()> {
         let now = unix_millis()?;
-        let _lock = self.store.acquire_lock()?;
+        let Some(_lock) = self.store.try_acquire_lock()? else {
+            return Ok(());
+        };
         self.record.observed_rss_bytes = observed_rss_bytes;
         self.record.observed_at_unix_millis = now;
         write_record(&self.store.record_path(self.record.pid), &self.record)
@@ -498,8 +522,12 @@ struct StoreLock {
 
 impl StoreLock {
     fn acquire(file: File) -> io::Result<Self> {
-        lock_file(&file)?;
+        lock_file(&file, true)?;
         Ok(Self { file })
+    }
+
+    fn try_acquire(file: File) -> io::Result<Option<Self>> {
+        Ok(lock_file(&file, false)?.then_some(Self { file }))
     }
 }
 
@@ -511,13 +539,24 @@ impl Drop for StoreLock {
     }
 }
 
+/// Lock `file` exclusively. A blocking call waits and returns `true`; a
+/// non-blocking call returns `false` when another holder has the lock.
 #[cfg(unix)]
-fn lock_file(file: &File) -> io::Result<()> {
+fn lock_file(file: &File, blocking: bool) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-        Ok(())
+    let operation = if blocking {
+        libc::LOCK_EX
     } else {
-        Err(io::Error::last_os_error())
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if !blocking && error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 
@@ -531,29 +570,31 @@ fn unlock_file(file: &File) -> io::Result<()> {
     }
 }
 
+/// Lock `file` exclusively. A blocking call waits and returns `true`; a
+/// non-blocking call returns `false` when another holder has the lock.
 #[cfg(windows)]
-fn lock_file(file: &File) -> io::Result<()> {
+fn lock_file(file: &File, blocking: bool) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
-        Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK},
+        Foundation::ERROR_LOCK_VIOLATION,
+        Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY},
         System::IO::OVERLAPPED,
     };
 
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    if unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            1,
-            0,
-            &mut overlapped,
-        )
-    } != 0
-    {
-        Ok(())
+    let flags = if blocking {
+        LOCKFILE_EXCLUSIVE_LOCK
     } else {
-        Err(io::Error::last_os_error())
+        LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY
+    };
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    if unsafe { LockFileEx(file.as_raw_handle(), flags, 0, 1, 0, &mut overlapped) } != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if !blocking && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(error)
     }
 }
 
@@ -994,6 +1035,72 @@ mod tests {
 
         drop(reservation);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_update_skips_a_tick_while_another_holder_has_the_lock() {
+        // The update runs on the supervisor's enforcement tick. A holder that
+        // stalls — stopped by job control, or slow to scan a large store —
+        // must cost this supervisor one skipped refresh, never its limits.
+        let directory = TestDirectory::new("contended-update");
+        let store = ReservationStore::new(directory.0.clone());
+        let mut reservation = store.reserve(4_096).expect("publish reservation");
+        let path = store.record_path(std::process::id());
+        let held = store.acquire_lock().expect("hold the store lock");
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = reservation
+                .update(1_024)
+                .map_err(|error| format!("{error:#}"));
+            sender.send(result).expect("report update result");
+            reservation
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("an update must not wait for a contended store lock");
+        assert_eq!(result, Ok(()));
+        let mut reservation = worker.join().expect("join update thread");
+        let record: ReservationRecord =
+            serde_json::from_slice(&fs::read(&path).expect("read reservation record"))
+                .expect("parse reservation record");
+        assert_eq!(
+            record.observed_rss_bytes, 0,
+            "a skipped tick writes nothing"
+        );
+
+        drop(held);
+        reservation
+            .update(2_048)
+            .expect("update after the lock is free");
+        let record: ReservationRecord =
+            serde_json::from_slice(&fs::read(&path).expect("read reservation record"))
+                .expect("parse reservation record");
+        assert_eq!(record.observed_rss_bytes, 2_048);
+        drop(reservation);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn the_process_checker_distinguishes_live_and_exited_processes() {
+        let mut checker = ReservationProcessChecker::new();
+        match checker
+            .inspect(std::process::id())
+            .expect("inspect current process")
+        {
+            // A start time is what lets a scan tell a reused PID from the
+            // original; losing it degrades identity to liveness alone.
+            ReservationProcess::Live { start_time } => {
+                assert!(start_time.is_some(), "no start time for a live process")
+            }
+            ReservationProcess::Dead => panic!("current process reported dead"),
+        }
+        assert!(matches!(
+            checker
+                .inspect(exited_process_id())
+                .expect("inspect exited process"),
+            ReservationProcess::Dead
+        ));
     }
 
     #[cfg(unix)]

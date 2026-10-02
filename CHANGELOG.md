@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - On macOS, read available memory from `kern.memorystatus_level`, so `auto` and percentage caps and the host reserve no longer collapse to a few MiB on a host whose memory compressor is large
+- A supervisor's reservation refresh skips a tick instead of waiting when another process holds the reservation store lock, so a stalled holder cannot pause memory and time enforcement
+- Check only the reservation processes a scan needs instead of snapshotting the whole process table while holding the store lock
 - Refuse with exit `75` when an `auto` or percentage memory limit resolves below 256 MiB, rather than starting the command under an unusable cap
 - Force externally signaled Unix process trees to stop after `--kill-after` when they ignore graceful termination
 
