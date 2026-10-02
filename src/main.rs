@@ -79,6 +79,12 @@ struct Cli {
     #[arg(long)]
     require_native: bool,
 
+    /// Keep the command in with-limits's own process group so it can read
+    /// from the terminal. Descendants that leave the tracked tree are then
+    /// not contained; Unix only
+    #[arg(long)]
+    foreground: bool,
+
     /// Suppress the startup summary (limit violations are always reported)
     #[arg(short, long)]
     quiet: bool,
@@ -254,7 +260,8 @@ fn run() -> Result<CommandResult> {
         command.env(name, value);
     }
 
-    let mut controller = platform::Controller::prepare(&mut command, memory, cpu, nice_adjustment)?;
+    let mut controller =
+        platform::Controller::prepare(&mut command, memory, cpu, nice_adjustment, cli.foreground)?;
     if cli.require_native {
         if memory.is_some() && !controller.memory_is_native() {
             bail!("native memory enforcement is unavailable on this platform");
@@ -925,6 +932,9 @@ fn print_summary(
             limits.push(format!("niceness +{adjustment}"));
         }
     }
+    if cli.foreground && cfg!(unix) {
+        limits.push("foreground".into());
+    }
     eprintln!("with-limits: {}", limits.join(", "));
 }
 
@@ -948,7 +958,7 @@ fn supervise(
                 .context("time limit is too large for the platform clock")
         })
         .transpose()?;
-    let mut tree = ProcessTree::new(child.id(), !cfg!(windows));
+    let mut tree = ProcessTree::new(child.id(), controller.group(), !cfg!(windows));
     let mut child_status = None;
     let mut throttle = CpuThrottle::new();
     let mut last_cpu_sample = started;
@@ -988,11 +998,17 @@ fn supervise(
             child_status = child
                 .try_wait()
                 .context("could not recheck an unobserved command")?;
-            if let Some(status) = child_status {
+            let Some(status) = child_status else {
+                bail!("could not observe the running command in the process table");
+            };
+            // The command exited before any poll saw it, but members of its
+            // process group may already have been adopted: they still run
+            // under the limits, as they would had the command been observed.
+            tree.retire_root();
+            if cfg!(windows) || tree.is_empty() {
                 controller.disarm();
                 return Ok(CommandResult::Status(status));
             }
-            bail!("could not observe the running command in the process table");
         }
 
         #[cfg(unix)]

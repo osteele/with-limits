@@ -28,7 +28,11 @@ mod imp {
     };
 
     pub struct Controller {
-        pgid: i32,
+        /// The command's process group, or `None` when `--foreground` left
+        /// it in the supervisor's own group, where only tracked processes
+        /// are signalled.
+        group: Option<i32>,
+        foreground: bool,
         targets: Arc<RwLock<Vec<ProcessIdentity>>>,
         signals: Option<Signals>,
         signal_sender: Option<Sender<()>>,
@@ -42,9 +46,12 @@ mod imp {
             memory: Option<u64>,
             cpu: Option<f64>,
             nice_adjustment: Option<i32>,
+            foreground: bool,
         ) -> Result<Self> {
             let _ = (memory, cpu);
-            command.process_group(0);
+            if !foreground {
+                command.process_group(0);
+            }
             if let Some(adjustment) = nice_adjustment {
                 unsafe {
                     command.pre_exec(move || lower_priority(adjustment));
@@ -55,7 +62,8 @@ mod imp {
             ])?;
             let (signal_sender, forwarded_signals) = mpsc::channel();
             Ok(Self {
-                pgid: 0,
+                group: None,
+                foreground,
                 targets: Arc::new(RwLock::new(Vec::new())),
                 signals: Some(signals),
                 signal_sender: Some(signal_sender),
@@ -65,11 +73,12 @@ mod imp {
         }
 
         pub fn attach(&mut self, child: &Child) -> Result<()> {
-            self.pgid = i32::try_from(child.id()).context("child PID is too large")?;
-            if self.pgid <= 1 {
-                bail!("refusing unsafe child process group {}", self.pgid);
+            let pid = i32::try_from(child.id()).context("child PID is too large")?;
+            if pid <= 1 {
+                bail!("refusing unsafe child process group {pid}");
             }
-            let pgid = self.pgid;
+            self.group = (!self.foreground).then_some(pid);
+            let group = self.group;
             let supervisor_pid =
                 i32::try_from(std::process::id()).context("supervisor PID is too large")?;
             let targets = Arc::clone(&self.targets);
@@ -87,10 +96,13 @@ mod imp {
                         .read()
                         .map(|value| value.clone())
                         .unwrap_or_default();
-                    if let Err(error) = signal_processes(pgid, &current, signal) {
+                    if let Err(error) = signal_processes(group, &current, signal) {
                         eprintln!("with-limits: could not forward signal {signal}: {error:#}");
                     }
                     if matches!(signal, SIGHUP | SIGINT | SIGQUIT | SIGTERM) {
+                        // A stopped process holds a terminating signal until
+                        // it is continued.
+                        let _ = signal_processes(group, &current, SIGCONT);
                         let _ = signal_sender.send(());
                     } else if signal == SIGTSTP {
                         // The installed handler suppresses SIGTSTP's default action.
@@ -120,20 +132,30 @@ mod imp {
             Ok(())
         }
 
+        /// The process group the command tree shares, for descendant
+        /// discovery by membership.
+        pub fn group(&self) -> Option<u32> {
+            self.group.and_then(|group| u32::try_from(group).ok())
+        }
+
+        /// Request graceful termination. The tree is continued afterwards:
+        /// a process stopped by SIGTTIN, SIGTSTP, or the CPU throttle would
+        /// otherwise hold the request until something else resumed it.
         pub fn terminate(&self, targets: &[ProcessIdentity]) -> Result<()> {
-            signal_processes(self.pgid, targets, SIGTERM)
+            signal_processes(self.group, targets, SIGTERM)?;
+            signal_processes(self.group, targets, SIGCONT)
         }
 
         pub fn kill(&self, targets: &[ProcessIdentity]) -> Result<()> {
-            signal_processes(self.pgid, targets, libc::SIGKILL)
+            signal_processes(self.group, targets, libc::SIGKILL)
         }
 
         pub fn suspend(&self, targets: &[ProcessIdentity]) -> Result<()> {
-            signal_processes(self.pgid, targets, libc::SIGSTOP)
+            signal_processes(self.group, targets, libc::SIGSTOP)
         }
 
         pub fn resume(&self, targets: &[ProcessIdentity]) -> Result<()> {
-            signal_processes(self.pgid, targets, libc::SIGCONT)
+            signal_processes(self.group, targets, libc::SIGCONT)
         }
 
         pub fn cpu_is_native(&self) -> bool {
@@ -172,17 +194,24 @@ mod imp {
                 .read()
                 .map(|value| value.clone())
                 .unwrap_or_default();
-            let _ = signal_processes(self.pgid, &targets, libc::SIGKILL);
+            let _ = signal_processes(self.group, &targets, libc::SIGKILL);
         }
     }
 
-    fn signal_processes(pgid: i32, targets: &[ProcessIdentity], signal: i32) -> Result<()> {
-        if pgid <= 1 {
-            bail!("refusing unsafe child process group {pgid}");
-        }
-
-        let group_error = signal_one(-pgid, signal).err();
-        let group_failed = group_error.is_some();
+    /// Signal the command's process group, when it has one, and then every
+    /// tracked process the group signal could not have reached: one that
+    /// left the group, or all of them when there is no group to signal.
+    fn signal_processes(
+        group: Option<i32>,
+        targets: &[ProcessIdentity],
+        signal: i32,
+    ) -> Result<()> {
+        let group_error = match group {
+            Some(pgid) if pgid <= 1 => bail!("refusing unsafe child process group {pgid}"),
+            Some(pgid) => signal_one(-pgid, signal).err(),
+            None => None,
+        };
+        let group_failed = group.is_none() || group_error.is_some();
         let mut first_error = None;
         let mut signaled_individually = false;
         for target in targets {
@@ -192,7 +221,7 @@ mod imp {
             }
             let escaped = group_failed
                 || match process_group(pid) {
-                    Ok(group) => group != Some(pgid),
+                    Ok(current) => current != group,
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -332,8 +361,11 @@ mod imp {
             memory: Option<u64>,
             cpu: Option<f64>,
             nice_adjustment: Option<i32>,
+            foreground: bool,
         ) -> Result<Self> {
-            let _ = memory;
+            // A Job Object contains the tree whatever console group the
+            // command runs in, so there is nothing for the flag to change.
+            let _ = (memory, foreground);
             let gate_name = format!(
                 "Local\\with-limits-{}-{}",
                 std::process::id(),
@@ -416,6 +448,10 @@ mod imp {
                 );
             }
             Ok(())
+        }
+
+        pub fn group(&self) -> Option<u32> {
+            None
         }
 
         pub fn set_targets(&self, targets: &[ProcessIdentity]) -> Result<()> {

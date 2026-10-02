@@ -392,6 +392,116 @@ time.sleep(10)"#,
 
 #[cfg(unix)]
 #[test]
+fn contains_a_group_member_whose_parent_exited_before_it_was_observed() {
+    // The shell forks a child and exits at once; with a long poll interval the
+    // supervisor first looks when the child has been reparented to init. Its
+    // process group is the only trace that it belongs to the command, so the
+    // time limit must still reach it and the supervisor must not return early.
+    let _guard = resource_test_guard();
+    let pid_file = temp_path("group-member");
+    let status = binary()
+        .args([
+            "--time",
+            "1s",
+            "--kill-after",
+            "100ms",
+            "--poll-interval",
+            "3s",
+            "-c",
+        ])
+        .arg(format!(
+            "sleep 30 & echo $! > {}; exit 0",
+            pid_file.display()
+        ))
+        .status()
+        .unwrap();
+    assert!(wait_for_path(&pid_file, Duration::from_secs(1)));
+    let pid = read_pid(&pid_file);
+    let survived = unsafe { libc::kill(pid, 0) } == 0;
+    if survived {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+    let _ = std::fs::remove_file(pid_file);
+
+    assert_eq!(status.code(), Some(124));
+    assert!(!survived, "orphaned group member survived the timeout");
+}
+
+/// Run `with-limits` under a pseudo-terminal through Python's `pty` module,
+/// typing `hello` once, and return its exit status and everything the terminal
+/// showed.
+#[cfg(unix)]
+fn run_under_a_terminal(args: &[&str]) -> (Option<i32>, String) {
+    let script = r#"import os, pty, sys
+sent = False
+def stdin_read(fd):
+    global sent
+    if sent:
+        return b""
+    sent = True
+    return b"hello\n"
+shown = bytearray()
+def master_read(fd):
+    data = os.read(fd, 1024)
+    shown.extend(data)
+    return data
+status = pty.spawn(sys.argv[1:], master_read, stdin_read)
+sys.stdout.buffer.write(bytes(shown))
+sys.exit(os.waitstatus_to_exitcode(status))"#;
+    let output = Command::new("python3")
+        .args(["-c", script, env!("CARGO_BIN_EXE_with-limits")])
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn a_terminal_read_stops_the_command_outside_the_foreground() {
+    // The command's own process group is not the terminal's foreground group,
+    // so the read stops it with SIGTTIN. The time limit's SIGTERM is followed
+    // by SIGCONT, so the stopped shell runs its trap within the grace period
+    // instead of holding the signal until the forced kill.
+    let _guard = resource_test_guard();
+    let (code, shown) = run_under_a_terminal(&[
+        "--time",
+        "1s",
+        "--kill-after",
+        "2s",
+        "--",
+        "sh",
+        "-c",
+        "trap 'echo got:term; exit 9' TERM; read x; echo got:$x",
+    ]);
+    assert_eq!(code, Some(124), "terminal showed: {shown}");
+    assert!(!shown.contains("got:hello"), "terminal showed: {shown}");
+    assert!(shown.contains("got:term"), "terminal showed: {shown}");
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_lets_the_command_read_the_terminal() {
+    let _guard = resource_test_guard();
+    let (code, shown) = run_under_a_terminal(&[
+        "--foreground",
+        "--time",
+        "10s",
+        "--",
+        "sh",
+        "-c",
+        "read x; echo got:$x",
+    ]);
+    assert_eq!(code, Some(0), "terminal showed: {shown}");
+    assert!(shown.contains("got:hello"), "terminal showed: {shown}");
+}
+
+#[cfg(unix)]
+#[test]
 fn requests_graceful_termination_before_forcing_the_tree() {
     let _guard = resource_test_guard();
     let marker = temp_path("graceful-marker");

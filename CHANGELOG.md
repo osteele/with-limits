@@ -11,8 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Seed `PYTORCH_MPS_HIGH_WATERMARK_RATIO` and `PYTORCH_MPS_LOW_WATERMARK_RATIO` for guarded trees on macOS, so PyTorch's Metal allocator respects roughly the share the guard enforces; override with `WITH_LIMITS_MPS_*_WATERMARK_RATIO` or disable with `WITH_LIMITS_MPS_WATERMARKS=off`
 - Forward `SIGQUIT`, `SIGUSR1`, `SIGUSR2`, `SIGWINCH`, `SIGTSTP`, and `SIGCONT` to Unix command trees according to their native roles
 - Independent `--reserve SIZE` admission estimates for commands using `--memory auto` or percentage caps
+- `--foreground` keeps the command in the supervisor's process group so it can read from the terminal, as GNU `timeout --foreground` does
 
 ### Fixed
+- Adopt a descendant that stayed in the command's process group even when its parent exited between two polls, so it no longer escapes the limits and the supervisor's exit by a race on the poll interval
+- Follow a graceful termination request with `SIGCONT`, so a tree stopped by `SIGTTIN`, `SIGTSTP`, or the CPU throttle receives it instead of waiting for the forced kill
 - Name the shared-`/tmp` fallback reservation store by user id, refuse a store that is a symlink, owned by another account, or writable by others, and never follow a symlink planted at a record or lock path
 - On macOS, read available memory from `kern.memorystatus_level`, so `auto` and percentage caps and the host reserve no longer collapse to a few MiB on a host whose memory compressor is large
 - A supervisor's reservation refresh skips a tick instead of waiting when another process holds the reservation store lock, so a stalled holder cannot pause memory and time enforcement

@@ -116,6 +116,9 @@ Options:
 - `--require-native` rejects a requested memory or CPU limit if the platform
   would enforce it by sampling. Memory limits are currently sampled on every
   platform; Windows CPU limits are native.
+- `--foreground` keeps the command in the supervisor's process group so it can
+  read from the terminal. See [Enforcement](#enforcement) for the tradeoff.
+  Unix only; accepted and ignored on Windows.
 - `--quiet`, `-q` suppresses the interactive startup summary. Limit violations
   are still reported.
 - `--no-reservation` ignores outstanding admission reservations and does not
@@ -143,8 +146,12 @@ parks work indefinitely without reducing risk.
 
 Free memory as a percentage of total is the signal that separates ordinary
 memory management from exhaustion, and the default floor is 10%. On macOS it
-is the kernel's own `kern.memorystatus_level`; elsewhere it is derived from
-available and total memory. On the workstation above, every state the gate
+is the kernel's own `kern.memorystatus_level`, the figure Apple's
+`memory_pressure` tool prints as the free percentage. It counts every page
+that is neither wired nor held by the compressor, active pages included, so
+it is well above the `vm_stat` free count: a host with 0.4% of pages free and
+40% in the compressor reported 31%. Elsewhere it is derived from available and
+total memory. On the workstation above, every state the gate
 refused sat between 27% and 53% free, while the state it exists to refuse had
 32 MB free, effectively zero.
 
@@ -310,7 +317,10 @@ supervisor writes one JSON file named by its process id. On Unix a store that
 is a symbolic link, is owned by another account, or is writable by group or
 others is refused: a command that would publish a reservation or wait for
 headroom fails before it starts, and `--check-headroom` ignores the store's
-records with a warning. Reservations do not coordinate across accounts.
+records with a warning. Reservations do not coordinate across accounts, nor
+across contexts of one account that resolve the store differently: on macOS a
+terminal session and an `ssh` or `launchd` session see different `TMPDIR`
+values, so set `WITH_LIMITS_RESERVATION_DIR` when both start guarded work.
 
 ## Enforcement
 
@@ -334,14 +344,33 @@ additionally enforce the unallocated share as a host-memory reserve, so
 unrelated or concurrently guarded growth can stop the command before its own
 RSS reaches its ceiling.
 
+On Unix the command runs in a process group of its own. The tracked tree is
+every process reached from the command through parent links, plus every
+member of that group, so a descendant whose parent exited between two polls
+is still found as long as it stayed in the group; one that called `setsid` or
+`setpgid` before it was observed is not. When the command exits while tracked
+descendants remain, `with-limits` keeps supervising them under the same limits
+and returns the command's status once the tree is empty.
+
+A separate process group is not the terminal's foreground group, so a command
+that reads from the terminal is stopped by `SIGTTIN` and waits there until a
+time limit ends it. Background jobs, agent hooks, and CI never read the
+terminal and are unaffected. For a command that must, `--foreground` leaves it
+in the supervisor's group, as GNU `timeout --foreground` does: terminal input
+and terminal-generated signals reach it directly, memory and time limits still
+apply to the tracked tree, but a descendant that leaves the tree before it is
+observed escapes containment, and a signal the terminal delivers to the group
+is forwarded once more by the supervisor.
+
 On Unix, terminating signals `SIGHUP`, `SIGINT`, `SIGQUIT`, and `SIGTERM` sent
 to `with-limits` are forwarded to the command's process group and to tracked
-descendants that have created another process group or session. `with-limits`
-then waits for `--kill-after` and forcibly terminates any tracked process that
-remains. `SIGUSR1`, `SIGUSR2`, and `SIGWINCH` are forwarded without starting
+descendants that have created another process group or session, followed by
+`SIGCONT` so a stopped process receives them. `with-limits` then waits for
+`--kill-after` and forcibly terminates any tracked process that remains.
+`SIGUSR1`, `SIGUSR2`, and `SIGWINCH` are forwarded without starting
 termination. `SIGTSTP` stops the command tree and supervisor; `SIGCONT` resumes
 and is forwarded to the tree. Unix limit violations request graceful
-termination and use the same grace period. A Windows Job Object terminates the
+termination the same way and use the same grace period. A Windows Job Object terminates the
 tree as a unit. If required monitoring or enforcement fails, `with-limits`
 stops the workload and exits with status 125.
 
