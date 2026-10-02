@@ -434,7 +434,9 @@ pub fn jitter_sample() -> f64 {
     mixed ^= mixed >> 33;
     mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
     mixed ^= mixed >> 33;
-    0.5 + (mixed as f64 / u64::MAX as f64)
+    // The top 53 bits over 2^53 is exact in an f64 and strictly below 1, which
+    // `mixed / u64::MAX` is not: the largest few inputs round up to 1.0.
+    0.5 + (mixed >> 11) as f64 / (1u64 << 53) as f64
 }
 
 #[cfg(test)]
