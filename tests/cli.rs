@@ -362,10 +362,13 @@ open({:?},"w").write(str(p.pid))
 time.sleep(10)"#,
         pid_file
     );
+    // The limit must outlast a niced Python start and spawn on a loaded host,
+    // where 750 ms was not enough; the deadline is still well inside both
+    // sleeps.
     let status = binary()
         .args([
             "--time",
-            "750ms",
+            "3s",
             "--kill-after",
             "100ms",
             "--",
