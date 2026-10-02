@@ -97,7 +97,10 @@ Options:
 
 - `--memory SIZE`, `-m SIZE` limits aggregate resident memory. Sizes accept SI
   suffixes such as `GB`, IEC suffixes such as `GiB`, `auto`, or a percentage of
-  initially available memory such as `60%`.
+  initially available memory such as `60%`. On macOS, available memory is the
+  kernel's free percentage (`kern.memorystatus_level`) of physical memory. A
+  percentage or `auto` limit that resolves below 256 MiB exits `75` without
+  running the command.
 - `--reserve SIZE` publishes an absolute memory estimate for admission,
   independently of the containment cap. An explicit absolute `--memory` size
   is also the reservation when this option is absent.

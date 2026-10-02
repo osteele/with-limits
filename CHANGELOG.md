@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Independent `--reserve SIZE` admission estimates for commands using `--memory auto` or percentage caps
 
 ### Fixed
+- On macOS, read available memory from `kern.memorystatus_level`, so `auto` and percentage caps and the host reserve no longer collapse to a few MiB on a host whose memory compressor is large
+- Refuse with exit `75` when an `auto` or percentage memory limit resolves below 256 MiB, rather than starting the command under an unusable cap
 - Force externally signaled Unix process trees to stop after `--kill-after` when they ignore graceful termination
 
 ## [0.1.0] - 2026-08-23

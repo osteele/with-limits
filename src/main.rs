@@ -26,6 +26,10 @@ const EXIT_WRAPPER_ERROR: u8 = 125;
 const EXIT_CANNOT_INVOKE: u8 = 126;
 const EXIT_NOT_FOUND: u8 = 127;
 const EXIT_MEMORY: u8 = 137;
+/// The smallest cap a percentage or `auto` limit may resolve to. Below this
+/// no ordinary command, let alone a coding agent, can start, so a host with
+/// less available memory is refused rather than given an unusable cap.
+const MIN_RELATIVE_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
 const DEFAULT_NICE_ADJUSTMENT: i32 = 10;
 const NICE_ENV: &str = "WITH_LIMITS_NICE";
 
@@ -232,6 +236,15 @@ fn run() -> Result<CommandResult> {
         system.available_memory()
     };
     let memory_budget = resolve_memory_budget(memory_spec, available)?;
+    if let Some(limit) = relative_limit_below_floor(memory_spec, memory_budget) {
+        eprintln!(
+            "with-limits: memory limit {} is below the {} minimum ({} available)",
+            format_bytes(limit),
+            format_bytes(MIN_RELATIVE_MEMORY_LIMIT),
+            format_bytes(available)
+        );
+        return Ok(CommandResult::Code(EXIT_HEADROOM_REFUSED));
+    }
     let memory = memory_budget.process_limit;
     let cpu = cli.cpu.map(|limit| limit.0);
     let nice_adjustment = configured_nice_adjustment()?;
@@ -318,6 +331,20 @@ fn resolve_memory_budget(spec: Option<MemorySpec>, available: u64) -> Result<Mem
         process_limit,
         host_reserve,
     })
+}
+
+/// The resolved cap, when a percentage or `auto` limit resolved below
+/// [`MIN_RELATIVE_MEMORY_LIMIT`]. An absolute size is the caller's explicit
+/// choice and is never second-guessed.
+fn relative_limit_below_floor(spec: Option<MemorySpec>, budget: MemoryBudget) -> Option<u64> {
+    match (spec, budget.process_limit) {
+        (Some(MemorySpec::AvailableFraction(_)), Some(limit))
+            if limit < MIN_RELATIVE_MEMORY_LIMIT =>
+        {
+            Some(limit)
+        }
+        _ => None,
+    }
 }
 
 fn host_reserve_crossed(reserve: u64, available: u64) -> bool {
@@ -712,27 +739,8 @@ fn mps_watermarks(var: &dyn Fn(&str) -> Option<OsString>) -> Vec<(&'static str, 
 }
 
 fn available_memory(system: &mut System) -> Result<u64> {
-    system.refresh_memory();
-    let available = system.available_memory();
-    if available > 0 {
+    if let Some(available) = headroom::current_available_memory(system) {
         return Ok(available);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("/usr/bin/memory_pressure")
-            .arg("-Q")
-            .output()
-            .context("could not run memory_pressure to determine available memory")?;
-        if !output.status.success() {
-            bail!(
-                "memory_pressure could not determine available memory: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        let output = String::from_utf8(output.stdout)
-            .context("memory_pressure returned non-UTF-8 output")?;
-        parse_memory_pressure_available(&output)
     }
 
     #[cfg(target_os = "linux")]
@@ -742,7 +750,7 @@ fn available_memory(system: &mut System) -> Result<u64> {
         parse_linux_mem_available(&meminfo)
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(target_os = "linux"))]
     bail!("the platform reported no available memory");
 }
 
@@ -769,33 +777,6 @@ fn parse_linux_mem_available(meminfo: &str) -> Result<u64> {
     kibibytes
         .checked_mul(1024)
         .context("MemAvailable overflows a byte count")
-}
-
-#[cfg(any(target_os = "macos", test))]
-fn parse_memory_pressure_available(output: &str) -> Result<u64> {
-    let total = output
-        .lines()
-        .find_map(|line| line.strip_prefix("The system has "))
-        .and_then(|rest| rest.split_whitespace().next())
-        .context("memory_pressure output does not report total memory")?
-        .parse::<u64>()
-        .context("memory_pressure total memory is not an unsigned integer")?;
-    let percent = output
-        .lines()
-        .find_map(|line| line.strip_prefix("System-wide memory free percentage:"))
-        .map(str::trim)
-        .and_then(|value| value.strip_suffix('%'))
-        .context("memory_pressure output does not report a percentage")?
-        .parse::<f64>()
-        .context("memory_pressure percentage is not numeric")?;
-    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
-        bail!("memory_pressure returned an invalid free-memory percentage");
-    }
-    let available = (total as f64 * percent / 100.0) as u64;
-    if available == 0 {
-        bail!("memory_pressure reports zero available memory");
-    }
-    Ok(available)
 }
 
 fn build_command(cli: &Cli) -> Result<Command> {
@@ -1468,8 +1449,6 @@ mod tests {
         std::fs::remove_dir_all(&store_path).expect("remove reservation test store");
     }
 
-    const MACOS_MEMORY_PRESSURE: &str = "The system has 17179869184 (1048576 pages with a page size of 16384).\nSystem-wide memory free percentage: 34%\n";
-
     #[test]
     fn parses_linux_mem_available_fixture() {
         let fixture = "MemTotal:       16384000 kB\nMemFree:         1024000 kB\nMemAvailable:    8388608 kB\nBuffers:          128000 kB\n";
@@ -1491,31 +1470,6 @@ mod tests {
         ] {
             assert!(
                 parse_linux_mem_available(fixture).is_err(),
-                "unexpectedly accepted {fixture:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn parses_macos_memory_pressure_fixture() {
-        assert_eq!(
-            parse_memory_pressure_available(MACOS_MEMORY_PRESSURE).unwrap(),
-            5_841_155_522
-        );
-    }
-
-    #[test]
-    fn rejects_macos_memory_pressure_schema_drift_and_invalid_values() {
-        for fixture in [
-            "System-wide memory free percentage: 34%\n",
-            "The system has 17179869184 bytes.\n",
-            "The system has many bytes.\nSystem-wide memory free percentage: 34%\n",
-            "The system has 17179869184 bytes.\nSystem-wide memory free percentage: many%\n",
-            "The system has 17179869184 bytes.\nSystem-wide memory free percentage: 101%\n",
-            "The system has 17179869184 bytes.\nSystem-wide memory free percentage: 0%\n",
-        ] {
-            assert!(
-                parse_memory_pressure_available(fixture).is_err(),
                 "unexpectedly accepted {fixture:?}"
             );
         }
@@ -1576,6 +1530,24 @@ mod tests {
             host_reserve_crossed(budget.host_reserve.unwrap(), 2_999),
             "every agent launched from the same snapshot observes the same crossed reserve"
         );
+    }
+
+    #[test]
+    fn relative_limit_resolving_below_the_floor_is_refused() {
+        // wl1: a 12.9 MiB reading resolved `auto` to a 9.0 MiB cap.
+        let spec = Some(MemorySpec::AvailableFraction(0.7));
+        let starved = resolve_memory_budget(spec, 13_526_630).unwrap();
+        assert_eq!(
+            relative_limit_below_floor(spec, starved),
+            starved.process_limit
+        );
+
+        let ample = resolve_memory_budget(spec, 8 * 1024 * 1024 * 1024).unwrap();
+        assert_eq!(relative_limit_below_floor(spec, ample), None);
+
+        let explicit = Some(MemorySpec::Bytes(1_024));
+        let small = resolve_memory_budget(explicit, 13_526_630).unwrap();
+        assert_eq!(relative_limit_below_floor(explicit, small), None);
     }
 
     #[test]

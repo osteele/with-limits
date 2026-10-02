@@ -42,8 +42,9 @@ impl Readings {
     /// not affect the others.
     pub fn collect(system: &mut System) -> Self {
         system.refresh_memory();
-        let available = system.available_memory();
         let total = system.total_memory();
+        let memory_free_percent = memory_free_percent(system.available_memory(), total);
+        let available = available_memory_bytes(system, memory_free_percent).unwrap_or(0);
         Self {
             pressure_level: kernel_pressure_level(),
             swap_free_bytes: Some(system.free_swap()),
@@ -53,9 +54,44 @@ impl Readings {
             total_bytes: (total > 0).then_some(total),
             available_fraction: (available > 0 && total > 0)
                 .then(|| available as f64 / total as f64),
-            memory_free_percent: memory_free_percent(available, total),
+            memory_free_percent,
         }
     }
+}
+
+/// Refresh `system`'s memory counters and read available memory as
+/// [`available_memory_bytes`] defines it.
+pub fn current_available_memory(system: &mut System) -> Option<u64> {
+    system.refresh_memory();
+    let percent = memory_free_percent(system.available_memory(), system.total_memory());
+    available_memory_bytes(system, percent)
+}
+
+/// Memory available to new work, in bytes, or `None` when the platform cannot
+/// say. `system`'s memory counters must already be fresh.
+///
+/// On macOS this is `kern.memorystatus_level` applied to physical memory, the
+/// same quantity admission consults. sysinfo's figure there subtracts the pages
+/// the compressor occupies from free plus inactive pages; on a host
+/// compressing heavily that difference is negative, or a residual of a few
+/// MiB, whatever the host's real headroom.
+pub fn available_memory_bytes(system: &System, memory_free_percent: Option<f64>) -> Option<u64> {
+    if cfg!(target_os = "macos") {
+        available_from_free_percent(memory_free_percent?, system.total_memory())
+    } else {
+        let available = system.available_memory();
+        (available > 0).then_some(available)
+    }
+}
+
+/// The bytes a free percentage of `total` represents, or `None` for a
+/// percentage outside 0-100 or a result of zero.
+pub fn available_from_free_percent(percent: f64, total: u64) -> Option<u64> {
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return None;
+    }
+    let available = (total as f64 * percent / 100.0) as u64;
+    (available > 0).then_some(available)
 }
 
 /// The thresholds a host must satisfy to admit new work.
@@ -403,6 +439,35 @@ pub fn jitter_sample() -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn available_memory_follows_the_free_percentage() {
+        let total = 17_179_869_184;
+        assert_eq!(
+            available_from_free_percent(34.0, total),
+            Some(5_841_155_522)
+        );
+        assert_eq!(available_from_free_percent(0.0, total), None);
+        assert_eq!(available_from_free_percent(101.0, total), None);
+        assert_eq!(available_from_free_percent(f64::NAN, total), None);
+        assert_eq!(available_from_free_percent(50.0, 0), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_available_memory_is_the_kernel_free_share_of_total() {
+        // wl1: sysinfo's figure subtracts compressor pages and collapses to a
+        // few MiB on a compressing host; the reading must track the kernel's
+        // free percentage instead.
+        let mut system = System::new();
+        let readings = Readings::collect(&mut system);
+        let percent = readings.memory_free_percent.expect("memorystatus_level");
+        let total = readings.total_bytes.expect("total memory");
+        assert_eq!(
+            readings.available_bytes,
+            available_from_free_percent(percent, total)
+        );
+    }
+
     use super::*;
 
     /// A policy that enforces the swap floor, for the tests whose subject is
