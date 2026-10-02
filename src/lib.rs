@@ -143,6 +143,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn displays_durations_in_seconds() {
+        assert_eq!(
+            HumanDuration(Duration::from_millis(1_500)).to_string(),
+            "1.5s"
+        );
+        assert_eq!(HumanDuration(Duration::from_secs(900)).to_string(), "900s");
+    }
+
+    #[test]
     fn parses_memory_sizes() {
         assert_eq!(
             "2GiB".parse(),

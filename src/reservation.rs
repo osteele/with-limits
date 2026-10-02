@@ -74,18 +74,6 @@ impl ReservationStore {
         policy: &Policy,
     ) -> Result<(Verdict, OutstandingReservations)> {
         let now = unix_millis()?;
-        #[cfg(unix)]
-        if fs::symlink_metadata(&self.path).is_ok() {
-            if let Err(error) = validate_store_directory(&self.path) {
-                // Records in a store another account can write prove nothing
-                // about this account's work, and counting them would let that
-                // account refuse admission at will.
-                eprintln!("with-limits: warning: ignoring reservations: {error:#}");
-                let outstanding = OutstandingReservations::default();
-                let verdict = headroom::decide_with_reservations(readings, policy, outstanding);
-                return Ok((verdict, outstanding));
-            }
-        }
         // A read takes the lock when it can and proceeds without it when it
         // cannot. Mutual exclusion makes a read's view consistent; it is not
         // what makes the answer correct, since each record is a separate file
@@ -96,6 +84,21 @@ impl ReservationStore {
         // a gate is for. Reserving still requires the lock; that one is a
         // real critical section.
         let lock = self.acquire_lock_for_read();
+        // Validated after the lock attempt, which creates a missing store, so
+        // the directory checked is the one scanned: checking first would let
+        // another account create it between the check and the scan. A store
+        // validated as this account's, mode 0700, cannot then be replaced by
+        // another account.
+        #[cfg(unix)]
+        if let Err(error) = validate_store_directory(&self.path) {
+            // Records in a store another account can write prove nothing
+            // about this account's work, and counting them would let that
+            // account refuse admission at will.
+            eprintln!("with-limits: warning: ignoring reservations: {error:#}");
+            let outstanding = OutstandingReservations::default();
+            let verdict = headroom::decide_with_reservations(readings, policy, outstanding);
+            return Ok((verdict, outstanding));
+        }
         let lock_state = if lock.is_some() {
             ScanLockState::Held
         } else {
@@ -961,6 +964,51 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_read_reaps_a_dead_reservation() {
+        let directory = TestDirectory::new("read-reap");
+        let store = ReservationStore::new(directory.0.clone());
+        let record = fixture_record(
+            exited_process_id(),
+            None,
+            4 << 30,
+            0,
+            unix_millis().unwrap(),
+        );
+        write_fixture(&store, &record);
+
+        let (_, outstanding) = store
+            .inspect(&healthy_readings(), &Policy::default())
+            .expect("read reservations");
+        assert_eq!(outstanding.count, 0);
+        assert!(!store.record_path(record.pid).exists());
+    }
+
+    #[test]
+    fn a_zero_budget_record_is_invalid() {
+        let directory = TestDirectory::new("zero-budget");
+        let store = ReservationStore::new(directory.0.clone());
+        let record = fixture_record(301, None, 0, 0, 100);
+        write_fixture(&store, &record);
+
+        let scan = store
+            .scan_with(100, ScanLockState::Held, |_| {
+                Ok(ReservationProcess::Live { start_time: None })
+            })
+            .expect("scan zero-budget record");
+        assert_eq!(scan.outstanding.count, 0);
+        assert!(scan.warnings[0].contains("must both be positive"));
+    }
+
+    #[test]
+    fn releasing_an_already_removed_record_succeeds() {
+        let directory = TestDirectory::new("release-missing");
+        let store = ReservationStore::new(directory.0.clone());
+        let mut reservation = store.reserve(1).expect("publish reservation");
+        fs::remove_file(store.record_path(std::process::id())).expect("remove record");
+        reservation.release().expect("release a missing record");
+    }
+
+    #[test]
     fn reaps_a_dead_process_reservation() {
         let directory = TestDirectory::new("dead");
         let store = ReservationStore::new(directory.0.clone());
@@ -1217,7 +1265,11 @@ mod tests {
         assert_eq!(record.process_start_time, expected_start_time);
         assert_eq!(record.budget_bytes, 4_096);
         assert_eq!(record.observed_rss_bytes, 1_024);
-        assert!(record.observed_at_unix_millis > 0);
+        let wall_clock = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        assert!(wall_clock.abs_diff(record.observed_at_unix_millis) < 60_000);
 
         drop(reservation);
         assert!(!path.exists());

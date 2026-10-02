@@ -1549,6 +1549,56 @@ mod tests {
     }
 
     #[test]
+    fn a_relative_limit_exactly_at_the_floor_runs() {
+        let spec = Some(MemorySpec::AvailableFraction(1.0));
+        let budget = resolve_memory_budget(spec, MIN_RELATIVE_MEMORY_LIMIT).unwrap();
+        assert_eq!(relative_limit_below_floor(spec, budget), None);
+    }
+
+    #[test]
+    fn admission_policy_follows_the_command_line() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(
+                ["with-limits"]
+                    .iter()
+                    .chain(args)
+                    .chain(["--", "true"].iter()),
+            )
+            .expect("parse admission flags")
+        };
+        let policy = admission_policy(&parse(&[]));
+        assert_eq!(policy.max_pressure, 2);
+        assert_eq!(policy.min_memory_free_percent, Some(10.0));
+
+        let policy = admission_policy(&parse(&[
+            "--max-pressure",
+            "4",
+            "--min-memory-free-percent",
+            "25",
+            "--max-load-per-cpu",
+            "1.5",
+            "--refuse-unknown",
+        ]));
+        assert_eq!(policy.max_pressure, 4);
+        assert_eq!(policy.min_memory_free_percent, Some(25.0));
+        assert_eq!(policy.max_load_per_cpu, Some(1.5));
+        assert!(policy.refuse_unknown);
+
+        let policy = admission_policy(&parse(&["--min-memory-free-percent", "0"]));
+        assert_eq!(policy.min_memory_free_percent, None);
+    }
+
+    #[test]
+    fn parses_free_percentages() {
+        assert_eq!(parse_free_percent("30"), Ok(30.0));
+        assert_eq!(parse_free_percent("0"), Ok(0.0));
+        assert_eq!(parse_free_percent("100"), Ok(100.0));
+        for value in ["-1", "101", "many"] {
+            assert!(parse_free_percent(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
     fn relative_limit_resolving_below_the_floor_is_refused() {
         // wl1: a 12.9 MiB reading resolved `auto` to a 9.0 MiB cap.
         let spec = Some(MemorySpec::AvailableFraction(0.7));

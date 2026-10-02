@@ -495,6 +495,67 @@ mod tests {
     }
 
     #[test]
+    fn names_reservations_only_when_they_push_free_memory_below_the_floor() {
+        let readings = Readings {
+            memory_free_percent: Some(5.0),
+            ..healthy()
+        };
+        let reservations = OutstandingReservations {
+            count: 1,
+            unrealized_bytes: 1 << 30,
+        };
+        let verdict = decide_with_reservations(&readings, &Policy::default(), reservations);
+        assert!(!verdict.admitted);
+        assert_eq!(verdict.refusing.len(), 1);
+        assert!(
+            verdict.refusing[0].starts_with("free memory "),
+            "a host already below the floor is not refused by its reservations: {:?}",
+            verdict.refusing
+        );
+    }
+
+    #[test]
+    fn unknown_free_memory_refuses_only_with_refuse_unknown() {
+        let readings = Readings {
+            memory_free_percent: None,
+            ..healthy()
+        };
+        let verdict = decide(&readings, &Policy::default());
+        assert!(verdict.admitted);
+        assert!(verdict.unknown.contains(&"free memory"));
+    }
+
+    #[test]
+    fn load_at_the_ceiling_is_admitted() {
+        let policy = Policy {
+            max_load_per_cpu: Some(0.5),
+            ..Policy::default()
+        };
+        assert!(decide(&healthy(), &policy).admitted);
+    }
+
+    #[test]
+    fn unknown_load_under_a_ceiling_refuses_only_with_refuse_unknown() {
+        let readings = Readings {
+            load_per_cpu: None,
+            ..healthy()
+        };
+        let policy = Policy {
+            max_load_per_cpu: Some(2.0),
+            ..Policy::default()
+        };
+        assert!(decide(&readings, &policy).admitted);
+    }
+
+    #[test]
+    fn names_pressure_levels() {
+        assert_eq!(pressure_name(1), "normal");
+        assert_eq!(pressure_name(2), "warn");
+        assert_eq!(pressure_name(4), "critical");
+        assert_eq!(pressure_name(3), "unknown");
+    }
+
+    #[test]
     fn admits_a_healthy_host() {
         let verdict = decide(&healthy(), &Policy::default());
         assert!(verdict.admitted);
