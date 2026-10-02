@@ -548,6 +548,36 @@ mod tests {
     }
 
     #[test]
+    fn available_memory_is_unknown_only_when_neither_reading_is() {
+        let readings = Readings {
+            available_bytes: None,
+            ..healthy()
+        };
+        assert!(!decide(&readings, &Policy::default())
+            .unknown
+            .contains(&"available memory"));
+        let readings = Readings {
+            available_bytes: None,
+            memory_free_percent: None,
+            ..healthy()
+        };
+        assert!(decide(&readings, &Policy::default())
+            .unknown
+            .contains(&"available memory"));
+    }
+
+    #[test]
+    fn jitter_samples_spread_across_their_range() {
+        // Pollers that draw the same jitter retry in lockstep, which is what
+        // the jitter exists to prevent.
+        let samples: Vec<f64> = (0..256).map(|_| jitter_sample()).collect();
+        assert!(samples.iter().all(|sample| (0.5..1.5).contains(sample)));
+        let low = samples.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(low < 0.75 && high > 1.25, "samples span only {low}..{high}");
+    }
+
+    #[test]
     fn names_pressure_levels() {
         assert_eq!(pressure_name(1), "normal");
         assert_eq!(pressure_name(2), "warn");

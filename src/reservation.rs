@@ -999,6 +999,25 @@ mod tests {
         assert!(scan.warnings[0].contains("must both be positive"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn releasing_reports_a_record_it_could_not_remove() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TestDirectory::new("release-denied");
+        let store = ReservationStore::new(directory.0.clone());
+        let mut reservation = store.reserve(1).expect("publish reservation");
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o500))
+            .expect("make the store read-only");
+        let result = reservation.release();
+        fs::set_permissions(&directory.0, fs::Permissions::from_mode(0o700))
+            .expect("restore the store");
+        assert!(result.is_err(), "a failed removal must be reported");
+        reservation
+            .release()
+            .expect("release once the store is writable");
+    }
+
     #[test]
     fn releasing_an_already_removed_record_succeeds() {
         let directory = TestDirectory::new("release-missing");
