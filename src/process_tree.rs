@@ -25,7 +25,17 @@ pub struct ProcessTree {
     root_identity: Option<u64>,
     root_retired: bool,
     known: HashMap<u32, u64>,
+    /// Consecutive finish checks at which the group still had members but no
+    /// snapshot had shown one alive.
+    unconfirmed_group_checks: u32,
 }
+
+/// How many consecutive finish checks a process group may report members
+/// that no snapshot shows alive. A live member a snapshot missed appears in
+/// the next one and is adopted; a group holding only zombies, which keep
+/// their group until reaped and are absent from every snapshot, would
+/// otherwise never finish.
+const GROUP_CONFIRMATION_CHECKS: u32 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct ProcessSnapshot {
@@ -50,6 +60,7 @@ impl ProcessTree {
             root_identity: None,
             root_retired: false,
             known: HashMap::new(),
+            unconfirmed_group_checks: 0,
         }
     }
 
@@ -112,6 +123,16 @@ impl ProcessTree {
             }
         }
 
+        // A group's id is its leader's pid, and a pid is not reused while a
+        // group with that id exists. A live process holding the retired
+        // root's pid therefore means the command's group is gone and its id
+        // now names an unrelated group, which must not be adopted or waited
+        // on.
+        if self.root_retired && self.group == Some(self.root) && by_pid.contains_key(&self.root) {
+            self.group = None;
+        }
+        let group_active = self.group.is_some();
+
         // Group members first, so the parent-chain walk below also reaches
         // the children of a member whose own parent exited unobserved. A
         // retired root's pid is never readopted, whatever group a successor
@@ -120,7 +141,10 @@ impl ProcessTree {
             .iter()
             .filter(|process| {
                 let readopted_root = self.root_retired && process.pid == self.root;
-                !self.known.contains_key(&process.pid) && !readopted_root && in_group(process.pid)
+                group_active
+                    && !self.known.contains_key(&process.pid)
+                    && !readopted_root
+                    && in_group(process.pid)
             })
             .map(|process| (process.pid, process.start_time))
             .collect();
@@ -163,12 +187,18 @@ impl ProcessTree {
     }
 
     /// Whether the command is finished: nothing tracked remains, and no
-    /// process is left in its process group. A process-table snapshot can
-    /// miss a member forked moments before the command exited, so the group
-    /// itself is the authority on whether members remain; a later poll then
-    /// adopts the member the snapshot missed.
-    pub fn is_finished(&self) -> bool {
-        self.is_empty() && !self.group.is_some_and(group_has_members)
+    /// live process is left in its process group. A process-table snapshot
+    /// can miss a member forked moments before the command exited, so a group
+    /// the kernel still reports members in is given
+    /// [`GROUP_CONFIRMATION_CHECKS`] further polls for a snapshot to show one;
+    /// the kernel also counts zombies, which no snapshot keeps.
+    pub fn is_finished(&mut self) -> bool {
+        if !self.is_empty() || !self.group.is_some_and(group_has_members) {
+            self.unconfirmed_group_checks = 0;
+            return self.is_empty();
+        }
+        self.unconfirmed_group_checks += 1;
+        self.unconfirmed_group_checks > GROUP_CONFIRMATION_CHECKS
     }
 
     pub fn observed_root(&self) -> bool {
@@ -324,14 +354,94 @@ mod tests {
             .spawn()
             .expect("start a group member");
         let group = member.id();
-        let tree = ProcessTree::new(group, Some(group), true);
+        let mut tree = ProcessTree::new(group, Some(group), true);
         assert!(tree.is_empty());
+        assert!(!tree.is_finished());
+
+        // The next poll's snapshot shows the member and adopts it.
+        let mut system = System::new();
+        tree.refresh(&mut system);
+        assert!(!tree.is_empty());
         assert!(!tree.is_finished());
 
         member.kill().expect("stop the group member");
         member.wait().expect("reap the group member");
+        tree.refresh(&mut system);
         assert!(tree.is_finished());
         assert!(ProcessTree::new(group, None, true).is_finished());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_holding_only_a_zombie_finishes_after_the_confirmation_polls() {
+        // The kernel counts an unreaped zombie as a group member, but no
+        // snapshot keeps it; waiting for it would never end.
+        use std::os::unix::process::CommandExt;
+        let mut zombie = std::process::Command::new("true")
+            .process_group(0)
+            .spawn()
+            .expect("start a short-lived group member");
+        let group = zombie.id();
+        // Wait for it to exit without reaping it, so it stays a zombie.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                group as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        assert_eq!(waited, 0, "wait for the member to exit");
+        // Linux counts the zombie as a group member; macOS does not, and
+        // there the group is finished at once.
+        let counted = group_has_members(group);
+
+        let mut system = System::new();
+        let mut tree = ProcessTree::new(group, Some(group), true);
+        tree.retire_root();
+        let checks: Vec<bool> = (0..=GROUP_CONFIRMATION_CHECKS)
+            .map(|_| {
+                tree.refresh(&mut system);
+                tree.is_finished()
+            })
+            .collect();
+        zombie.wait().expect("reap the zombie");
+        let expected = if counted {
+            [false, false, true]
+        } else {
+            [true, true, true]
+        };
+        assert_eq!(checks, expected);
+    }
+
+    #[test]
+    fn stops_group_adoption_once_the_group_id_is_reused() {
+        // A process holding the retired root's pid proves the command's group
+        // died out and its id was reused; members of that new group belong
+        // to someone else.
+        let mut tree = ProcessTree::new(10, Some(10), true);
+        tree.update(
+            &[
+                process(10, Some(1), 1, 100, 10.0),
+                process(20, Some(10), 2, 200, 20.0),
+            ],
+            |_| false,
+        );
+        tree.retire_root();
+
+        let usage = tree.update(
+            &[
+                process(20, Some(1), 2, 200, 20.0),
+                process(10, Some(1), 7, 100, 10.0),
+                process(40, Some(10), 8, 400, 40.0),
+            ],
+            |pid| pid == 10 || pid == 40,
+        );
+
+        assert_eq!(identities(&tree), HashSet::from([(20, 2)]));
+        assert_eq!(usage.rss_bytes, 200);
+        assert_eq!(tree.group, None);
     }
 
     #[test]
